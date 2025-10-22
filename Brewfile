@@ -1,0 +1,10 @@
+brew "ollama"
+brew "python@3.11"
+brew "cmake"
+brew "pkg-config"
+brew "tesseract"
+brew "ffmpeg"
+brew "sqlcipher"
+# brew "ollama/tap/ollama"
+# Optional frontend/developer tools
+brew "node"
