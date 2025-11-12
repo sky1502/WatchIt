@@ -8,7 +8,9 @@ judge (via Ollama). No cloud calls, no telemetry—everything runs on your machi
 - [How It Works](#how-it-works)
 - [Prerequisites](#prerequisites)
 - [Quick Start (macOS)](#quick-start-macos)
+- [Quick Start (Windows)](#quick-start-windows)
 - [Manual Setup](#manual-setup)
+- [Environment Files](#environment-files)
 - [Running the Services](#running-the-services)
   - [FastAPI backend](#fastapi-backend)
   - [Next.js dashboard](#nextjs-dashboard)
@@ -89,6 +91,31 @@ When `setup.sh` completes you will have:
 - All Python requirements installed.
 - Ollama running locally with the `llama3.1` model pulled (adjust in `.env` if desired).
 
+## Quick Start (Windows)
+```powershell
+# 1) Clone and enter the repo
+git clone <your-fork-url>
+cd WatchIt
+
+# 2) Create + activate a virtual environment (PowerShell)
+py -3.11 -m venv .venv
+.\.venv\Scripts\activate
+
+# 3) Install Python dependencies
+python -m pip install --upgrade pip wheel setuptools
+pip install -r requirements.txt
+
+# 4) Install Node.js 18+ (https://nodejs.org/) and Ollama for Windows (https://ollama.com/download)
+#    Run `ollama serve` once, then pull your preferred model:
+ollama pull qwen2.5:7b-instruct-q4_K_M
+
+# 5) Create `.env` (repo root)—copy from `.env.example` if you keep one—fill in secrets, then start the API
+uvicorn app.main:app --reload --host 127.0.0.1 --port 4849
+```
+Windows does not ship with Homebrew, so use `winget`/`choco` for system dependencies (Git, Python,
+Node.js, SQLite/SQLCipher) as needed. Dashboard/extension commands are identical once the backend is
+running.
+
 ## Manual Setup
 Prefer to wire things up by hand? Follow these steps:
 
@@ -106,6 +133,37 @@ ollama pull qwen2.5:7b-instruct-q4_K_M  # or llama3.1, change via WATCHIT_OLLAMA
 
 Enable OCR support by keeping the default Python dependencies (PaddleOCR + PaddlePaddle). To
 skip screenshot parsing entirely, set `WATCHIT_ENABLE_OCR=false` in `.env`.
+
+## Environment Files
+- **Backend `.env` (repo root)** – create this file
+  and populate the environment variables consumed by `core/config.py`. A minimal file looks like:
+
+  ```dotenv
+  WATCHIT_DB_PATH=
+  WATCHIT_DB_KEY=change_this_strong_key
+  WATCHIT_PARENT_PIN=
+  WATCHIT_BIND_HOST=
+  WATCHIT_BIND_PORT=
+  WATCHIT_OLLAMA_MODEL=
+  WATCHIT_ENABLE_OCR=
+  WATCHIT_PG_DSN=  # optional, needed for Postgres mirroring
+  ```
+
+  Store secrets (DB key, PIN, Postgres credentials) in this file. The FastAPI app
+  automatically reads it via `python-dotenv`.
+
+- **Dashboard `ui/.env.local`** – lives inside the `ui` folder and powers Next.js + Firebase auth:
+
+  ```dotenv
+  NEXT_PUBLIC_FIREBASE_API_KEY=AIza...
+  NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=project.firebaseapp.com
+  NEXT_PUBLIC_FIREBASE_PROJECT_ID=project-id
+  NEXT_PUBLIC_FIREBASE_APP_ID=1:123:web:abc
+  WATCHIT_DASHBOARD_API_BASE=http://127.0.0.1:4849  # optional helper for fetch calls
+  ```
+
+- Keep `.env` and `ui/.env.local` synchronized with the same API host/port you expose via
+  `WATCHIT_BIND_HOST`/`WATCHIT_BIND_PORT` so the dashboard and extension can talk to the backend.
 
 ## Running the Services
 
@@ -141,12 +199,18 @@ Once authenticated the dashboard:
   standard, strict) and **child age** that immediately influence the LLM prompt/policy.
 
 ### Chrome/Chromium extension
-1. Navigate to `chrome://extensions`, enable **Developer mode**, and choose **Load unpacked**.
-2. Point Chrome at the `extension_chromium` directory.
-3. The service worker (`background.js`) will subscribe to `{API}/v1/stream/decisions` and
-   enforce actions on every tab.
-4. The content script (`content.js`) renders warnings, blurs media, or shows a blocking
-   interstitial based on policy action.
+1. Ensure the FastAPI backend is running and reachable (match the host/port in the steps below).
+2. Open `extension_chromium/background.js` and update `const API = "http://127.0.0.1:4849";` (and
+   `childId` if you track multiple children) so it points to your backend.
+3. In Chrome/Chromium visit `chrome://extensions`, enable **Developer mode**, and choose **Load
+   unpacked**.
+4. Select the `extension_chromium` directory. Chrome will load `manifest.json` plus the service
+   worker.
+5. The service worker subscribes to `${API}/v1/stream/decisions` via SSE and relays decisions to
+   every tab. When the backend responds with `needs_ocr=true`, the extension captures a screenshot
+   and posts it to `${API}/v1/event/upgrade`.
+6. The content script (`content.js`) listens for those decisions and renders warnings, blur effects,
+   or a blocking interstitial.
 
 ### Postgres replicator (optional)
 Need a centralized datastore while keeping the low-latency local path? Use
