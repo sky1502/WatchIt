@@ -66,7 +66,6 @@ Each agent writes its findings into the `MonitorState`, and the policy engine co
 3. When the LLM still isn’t sure, the SSE response instructs the extension to capture screenshots so the **Screenshots + OCR layer** can enrich the text and rerun the LLM, after which the policy engine makes the final call.
 
 ## Prerequisites
-- macOS 13+ is the primary target (Linux/Windows work with equivalent tooling).
 - Python 3.11 (minimum 3.10).
 - Node.js 18+ (for the Next.js dashboard).
 - [Ollama](https://ollama.com/) installed and running locally.
