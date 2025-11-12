@@ -1,0 +1,74 @@
+# ==========================
+# PYTHON BACKEND
+# ==========================
+
+# Bytecode cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.env
+.venv/
+venv/
+env/
+
+# Logs and runtime files
+logs/
+*.log
+
+# Local databases or cache files
+*.sqlite3
+*.db
+
+# Build / analysis outputs
+analysis/__pycache__/
+analysis/agents/__pycache__/
+analysis/agents/tmp/
+runtime/__pycache__/
+core/__pycache__/
+
+# OS files
+.DS_Store
+
+
+# ==========================
+# FRONTEND (Next.js / Node)
+# ==========================
+
+# Dependencies and builds
+ui/node_modules/
+ui/.next/
+ui/.turbo/
+ui/out/
+ui/dist/
+ui/.vercel/
+
+# Environment files
+ui/.env
+ui/.env.local
+ui/.env.development
+ui/.env.production
+
+# Optional editor caches
+ui/.eslintcache
+ui/.stylelintcache
+
+# ==========================
+# OTHERS
+# ==========================
+
+# IDE settings
+.vscode/
+.idea/
+
+# Local test or sandbox dirs
+tmp/
+test_output/
+
+# Ignore any local deployment scripts or keys
+*.pem
+*.key
+*.crt
+
