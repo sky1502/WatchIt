@@ -20,23 +20,33 @@ class JudgeOut(BaseModel):
     severity: str        # "low" | "medium" | "high"
     rationale: str       # <= 30 words
     action: str          # "allow" | "warn" | "blur" | "block" | "notify"
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
 
-SYSTEM_PROMPT = (
+SYSTEM_PROMPT_TEMPLATE = (
 "You are a children's online safety classifier running on-device. "
-"Evaluate if the given webpage content is suitable for a 10–13 year old. "
-"Consider violence, sexual content, profanity, drugs, self-harm, hate. "
-"Be conservative. If unsure, choose 'warn'. "
+"Evaluate if the given webpage content is suitable for a child age {age}. "
+"Guardian strictness level is '{strictness}'. Lenient means only block severe harm, "
+"standard balances caution, strict should warn or block whenever uncertain. "
+"Use every signal provided: URL/domain (e.g., nsfw subdomains), page title/meta tags, "
+"visible text, hyperlinks, scripts/trackers, and OCR summaries of screenshots (if present). "
+"Flag issues such as adult content, gambling, hate, violence, drugs, self-harm, bullying, "
+"or risky redirects hinted by the metadata. "
+"Be conservative relative to the requested strictness. If unsure, choose 'warn'. "
 "Output STRICT JSON with keys: is_harmful (bool), categories (array), "
-"severity (low|medium|high), rationale (<=30 words), action (allow|warn|blur|block|notify)."
+"severity (low|medium|high), rationale (<=30 words), action (allow|warn|blur|block|notify), "
+"confidence (0.0-1.0 expressing how certain you are in the requested action)."
 )
 
-def build_human_prompt(page_title: str, domain: str, fast_scores: Dict[str, float], text_sample: str) -> str:
+def build_human_prompt(page_title: str, domain: str, fast_scores: Dict[str, float], text_sample: str, child_age: int, strictness: str) -> str:
     # Keep payload compact (cap text to ~2000 chars)
     text_snippet = (text_sample or "")[:2000]
     return (
         f"PAGE_TITLE: {page_title}\n"
         f"DOMAIN: {domain}\n"
+        f"CHILD_PROFILE: age={child_age}, strictness={strictness}\n"
         f"FAST_SCORES: {fast_scores}\n"
+        "RISK_HINTS: use URL keywords (nsfw, porn, casino), metadata text, hyperlinks, "
+        "scripts/trackers, sentiment, OCR text for images/videos, and tone for slurs/bullying.\n"
         f"TEXT_SNIPPET:\n{text_snippet}\n\n"
         "Return STRICT JSON only."
     )
@@ -58,10 +68,20 @@ class LLMJudge:
         page_title: str,
         domain: str,
         fast_scores: Dict[str, float],
-        text_sample: str
+        text_sample: str,
+        child_age: int,
+        strictness: str,
     ) -> Dict[str, Any]:
-        prompt = build_human_prompt(page_title, domain, fast_scores, text_sample)
-        msgs = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=prompt)]
+        if strictness not in {"lenient", "standard", "strict"}:
+            strictness = "standard"
+        try:
+            child_age = int(child_age)
+        except Exception:
+            child_age = 12
+        child_age = max(3, min(18, child_age))
+        prompt = build_human_prompt(page_title, domain, fast_scores, text_sample, child_age, strictness)
+        system_prompt = SYSTEM_PROMPT_TEMPLATE.format(age=child_age, strictness=strictness)
+        msgs = [SystemMessage(content=system_prompt), HumanMessage(content=prompt)]
 
         # Send to Ollama
         try:
@@ -76,7 +96,17 @@ class LLMJudge:
                 "severity": "low",
                 "rationale": f"LLM call failed: {e}",
                 "action": "allow",
+                "confidence": 0.0,
             }
+
+        fallback_block = {
+            "is_harmful": True,
+            "categories": ["llm_refusal"],
+            "severity": "medium",
+            "rationale": "LLM refused or returned invalid output; treat as unsafe.",
+            "action": "block",
+            "confidence": 0.2,
+        }
 
         # Try to parse JSON
         try:
@@ -89,10 +119,10 @@ class LLMJudge:
                     data = json.loads(m.group(0))
                 except Exception as inner_e:
                     self.logger.error("Fallback JSON parse failed: %s", inner_e)
-                    data = {}
+                    return fallback_block
             else:
                 self.logger.error("No JSON object found in response")
-                data = {}
+                return fallback_block
 
         # Validate with Pydantic
         try:
@@ -100,10 +130,3 @@ class LLMJudge:
             return result
         except Exception as e:
             self.logger.error("Validation failed: %s. Data: %s", e, data)
-            return {
-                "is_harmful": False,
-                "categories": [],
-                "severity": "low",
-                "rationale": "fallback after validation error",
-                "action": "allow",
-            }

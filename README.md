@@ -12,8 +12,8 @@ judge (via Ollama). No cloud calls, no telemetry—everything runs on your machi
 - [Running the Services](#running-the-services)
   - [FastAPI backend](#fastapi-backend)
   - [Next.js dashboard](#nextjs-dashboard)
-  - [Streamlit dashboard](#streamlit-dashboard)
   - [Chrome/Chromium extension](#chromechromium-extension)
+  - [Postgres replicator (optional)](#postgres-replicator-optional)
 - [Configuration](#configuration)
 - [API Surface](#api-surface)
 - [Data & Security](#data--security)
@@ -21,7 +21,7 @@ judge (via Ollama). No cloud calls, no telemetry—everything runs on your machi
 
 ## Why WatchIt
 - **Private by design** – Event capture, analysis, and policy enforcement stay on-device.
-- **Layered safety checks** – Fast keyword heuristics, optional OCR/ASR, and an agentic LLM
+- **Layered safety checks** – Fast keyword heuristics, optional PaddleOCR screenshot parsing, and an agentic LLM
   (LangGraph + Ollama) collaborate on every event.
 - **Live enforcement** – A Chromium extension streams policy decisions via server-sent events
   (SSE) and can warn, blur, or block pages in real time.
@@ -33,21 +33,43 @@ judge (via Ollama). No cloud calls, no telemetry—everything runs on your machi
 ## How It Works
 1. The browser extension emits a `visit` event when navigation commits, including a DOM text
    sample and metadata.
-2. The FastAPI backend (`app/main.py`) stores the event, runs the LangGraph workflow, and
-   persists both heuristic scores and LLM judgements.
-3. The policy engine (`policy/engine.py`) folds in schedules, allow/block lists, and model
-   outputs to produce an action (`allow`, `warn`, `blur`, `block`, `notify`).
+2. The FastAPI backend (`app/main.py`) stores the event, then runs an **agent pipeline**:
+   - **URL/Metadata Agent** inspects DOM/text, calls the on-device LLM, and emits a decision
+     with confidence tied to the child’s strictness/age.
+   - **Headlines Agent** focuses on titles/headlines to raise or lower risk.
+   - **Screenshot + OCR Agents** collaborate when the confidence is low; the backend tells the
+     extension to capture screenshots, and PaddleOCR extracts extra text for a second pass.
+3. The policy engine (`policy/engine.py`) folds in schedules, allow/block lists, agent output,
+   and model confidence to produce an action (`allow`, `warn`, `blur`, `block`, `notify`).
 4. Final decisions are published over SSE so the extension and dashboards react instantly.
-5. Dashboards (`ui` Next.js app or `dashboard.py` Streamlit app) display live and historical
-   events for guardians.
+5. The Next.js dashboard (`ui` folder) displays live and historical events for guardians
+   after they sign in with a Google account provisioned in Firebase. It reads from the
+   Postgres mirror and lets guardians edit per-child strictness + age to steer the LLM. The
+   LLM also returns a confidence score; only when confidence is low do the screenshot/OCR
+   agents run.
+
+## Agent Architecture
+| Agent | Purpose | Key Tools |
+| --- | --- | --- |
+| **Headlines Agent (Layer 1)** | Fast heuristics over URL/title + keyword scores. If confidence is high it can allow/block instantly without waking heavier agents. | SafetyAnalyzer, domain/title keyword lists |
+| **URL/Metadata Agent (Layer 2)** | When the first layer is unsure, this agent ingests DOM text/metadata and queries the on-device LLM for a structured verdict tuned to child strictness/age. | SafetyAnalyzer (reused), `ChatOllama` |
+| **Screenshots Agent** | Decides if screenshots are available and whether the browser must capture new ones when the LLM confidence stays low. | Browser extension hooks, event payload metadata |
+| **OCR Agent (Layer 3)** | Runs PaddleOCR on screenshots and feeds the extracted text back through the URL/Metadata agent for a final pass. | `analysis/ocr_asr.py`, PaddleOCR |
+
+Each agent writes its findings into the `MonitorState`, and the policy engine consumes the combined view before publishing the final action.
+
+**Layered flow**
+1. **Headlines layer** runs immediately—if it’s confident enough, the system blocks/allows without hitting the LLM.
+2. Only when the first layer warns or stays low-confidence does the **URL/Metadata layer** run the LLM. Its confidence determines whether OCR is required.
+3. When the LLM still isn’t sure, the SSE response instructs the extension to capture screenshots so the **Screenshots + OCR layer** can enrich the text and rerun the LLM, after which the policy engine makes the final call.
 
 ## Prerequisites
 - macOS 13+ is the primary target (Linux/Windows work with equivalent tooling).
 - Python 3.11 (minimum 3.10).
 - Node.js 18+ (for the Next.js dashboard).
 - [Ollama](https://ollama.com/) installed and running locally.
-- (Optional) Tesseract OCR and Whisper runtime for screenshot/audio analysis. The `Brewfile`
-  includes everything needed on macOS.
+- (Optional) PaddleOCR runtime (PaddlePaddle + PaddleOCR Python packages) if you plan to use
+  screenshot text extraction.
 
 ## Quick Start (macOS)
 ```bash
@@ -82,8 +104,8 @@ ollama serve &
 ollama pull qwen2.5:7b-instruct-q4_K_M  # or llama3.1, change via WATCHIT_OLLAMA_MODEL
 ```
 
-Enable OCR/ASR support by installing the optional Brew packages (Tesseract, FFmpeg) or
-disable them by setting `WATCHIT_ENABLE_OCR=false` / `WATCHIT_ENABLE_ASR=false`.
+Enable OCR support by keeping the default Python dependencies (PaddleOCR + PaddlePaddle). To
+skip screenshot parsing entirely, set `WATCHIT_ENABLE_OCR=false` in `.env`.
 
 ## Running the Services
 
@@ -98,18 +120,25 @@ The interactive OpenAPI docs are available at `http://127.0.0.1:4849/docs`.
 ```bash
 cd ui
 npm install
+cp .env.local.example .env.local  # fill with Firebase config
 npm run dev   # serves on http://127.0.0.1:4848 by default
 ```
-The dashboard consumes the REST/SSE endpoints from the backend and shows live decisions as
-they land.
+Before starting the dashboard:
+1. Create a Firebase project (https://console.firebase.google.com/), enable **Authentication → Sign-in method → Google**.
+2. Copy the Web app credentials into `ui/.env.local`:
+   - `NEXT_PUBLIC_FIREBASE_API_KEY`
+   - `NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN`
+   - `NEXT_PUBLIC_FIREBASE_PROJECT_ID`
+   - `NEXT_PUBLIC_FIREBASE_APP_ID`
+3. Configure Postgres access for the backend/replicator via `WATCHIT_PG_DSN` and keep the
+   replicator running so the dashboard can read mirrored data.
+4. Load `http://127.0.0.1:4848` and sign in with an approved Google (Gmail) account.
 
-### Streamlit dashboard
-For a quick standalone dashboard, run:
-```bash
-source .venv/bin/activate
-streamlit run dashboard.py
-```
-Use the sidebar controls to filter by child ID and adjust history depth.
+Once authenticated the dashboard:
+- Reads historical events/decisions straight from Postgres.
+- Streams in fresh decisions via SSE for real-time awareness.
+- Exposes PIN-based pause/resume plus per-child controls for **strictness** (lenient,
+  standard, strict) and **child age** that immediately influence the LLM prompt/policy.
 
 ### Chrome/Chromium extension
 1. Navigate to `chrome://extensions`, enable **Developer mode**, and choose **Load unpacked**.
@@ -118,6 +147,31 @@ Use the sidebar controls to filter by child ID and adjust history depth.
    enforce actions on every tab.
 4. The content script (`content.js`) renders warnings, blurs media, or shows a blocking
    interstitial based on policy action.
+
+### Postgres replicator (optional)
+Need a centralized datastore while keeping the low-latency local path? Use
+`runtime/pg_replicator.py` to mirror SQLCipher rows into Postgres without slowing the main
+pipeline.
+
+```bash
+WATCHIT_PG_DSN="postgresql://user:pass@localhost/watchit" \
+python -m runtime.pg_replicator
+```
+
+By default the replicator:
+- Polls SQLite every 5 seconds for new events/decisions and upserts child profiles.
+- Creates `watchit_events` and `watchit_decisions` tables in Postgres (JSONB columns for the
+  original payloads) plus `watchit_children` for child metadata (strictness, age).
+- Tracks progress in the SQLite `settings` table (`pg_last_event_ts`, `pg_last_decision_ts`)
+  so restarts resume where they left off.
+
+Embed it into another service with:
+
+```python
+from runtime.pg_replicator import PostgresReplicator
+replicator = PostgresReplicator(pg_dsn=os.environ["WATCHIT_PG_DSN"])
+asyncio.create_task(replicator.run_forever())
+```
 
 ## Configuration
 Override defaults via a `.env` file. The most relevant settings (see `core/config.py` for
@@ -131,14 +185,29 @@ the complete list):
 | `WATCHIT_SCHEDULE_DAYS` | CSV of quiet-hour days | `Mon,Tue,Wed,Thu` |
 | `WATCHIT_SCHEDULE_QUIET` | Quiet-hour window (`HH:MM-HH:MM`) | `21:00-07:00` |
 | `WATCHIT_OLLAMA_MODEL` | LLM used by the judge | `qwen2.5:7b-instruct-q4_K_M` |
-| `WATCHIT_ENABLE_OCR` / `WATCHIT_ENABLE_ASR` | Enable screenshot/audio parsing | `true` |
+| `WATCHIT_ENABLE_OCR` | Enable screenshot parsing via PaddleOCR | `true` |
+| `WATCHIT_OCR_CONFIDENCE_THRESHOLD` | Confidence cut-off (0-1) before OCR upgrade required | `0.7` |
+| `WATCHIT_PG_DSN` | Postgres connection string for mirrored data | _unset_ |
+
+Dashboard env vars (`ui/.env.local`) control Firebase authentication for the web dashboard:
+
+| Variable | Purpose |
+| --- | --- |
+| `NEXT_PUBLIC_FIREBASE_API_KEY` | Web API key from the Firebase project |
+| `NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN` | Auth domain (e.g., `project.firebaseapp.com`) |
+| `NEXT_PUBLIC_FIREBASE_PROJECT_ID` | Firebase project ID |
+| `NEXT_PUBLIC_FIREBASE_APP_ID` | App ID from Firebase console |
 
 Update the `.env` file before starting the backend so the settings are loaded at launch.
 
 ## API Surface
 - `POST /v1/event` – ingest a single event. Body must match `app.api_models.EventInput`.
+- Responses from `/v1/event` and SSE payloads include `confidence` (LLM certainty 0-1) and
+  `needs_ocr` (whether the browser should capture a screenshot for OCR).
 - `GET /v1/events` – fetch recent events (filter by `child_id`, limit default 50).
 - `GET /v1/decisions` – fetch recent decisions.
+- `GET /v1/children` – list mirrored child profiles (strictness, age).
+- `POST /v1/children/{child_id}/settings` – update a child's strictness/age (reflected in SQLite + Postgres).
 - `GET /v1/stream/decisions` – SSE stream of new decisions as they are made.
 - `POST /v1/control/pause` – pause enforcement for `minutes` (requires parent PIN).
 - `POST /v1/control/resume` – resume monitoring (requires parent PIN).

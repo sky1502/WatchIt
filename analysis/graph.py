@@ -1,43 +1,135 @@
 from __future__ import annotations
+
 from typing import Dict, Any
 from langgraph.graph import StateGraph, START, END
 from pydantic import BaseModel, Field
-from analysis.safety import SafetyAnalyzer
-from analysis.llm_judge import LLMJudge
-import json
-from urllib.parse import urlparse
+
+from analysis.agents import (
+    URLMetadataAgent,
+    HeadlinesAgent,
+    OCRAgent,
+    ScreenshotsAgent,
+)
+from core.config import settings
+from core.activity_logger import log_step
+
+HEADLINE_DECISION_THRESHOLD = 0.85
+
 
 class MonitorState(BaseModel):
     event: Dict[str, Any]
+    child_profile: Dict[str, Any] = Field(default_factory=dict)
     fast_scores: Dict[str, float] = Field(default_factory=dict)
     judge_json: Dict[str, Any] = Field(default_factory=dict)
+    headline_result: Dict[str, Any] = Field(default_factory=dict)
+    confidence: float = 1.0
+    ocr_text: str = ""
+    need_llm: bool = True
+    need_ocr: bool = False
+    needs_screenshot: bool = False
 
-analyzer = SafetyAnalyzer()
-judge = LLMJudge()
 
-def node_fast_scores(state: MonitorState) -> MonitorState:
-    scores = analyzer.analyze_event_fast(state.event)
-    state.fast_scores = scores
+headlines_agent = HeadlinesAgent()
+url_agent = URLMetadataAgent()
+ocr_agent = OCRAgent()
+screens_agent = ScreenshotsAgent()
+
+
+def node_headline_layer(state: MonitorState) -> MonitorState:
+    result = headlines_agent.run(state.event, state.child_profile)
+    state.fast_scores = result.fast_scores
+    state.headline_result = {
+        "risk": result.risk,
+        "flags": result.flags,
+        "confidence": result.confidence,
+        "action": result.action,
+    }
+    state.need_llm = True
+    if result.action in ("allow", "block") and result.confidence >= HEADLINE_DECISION_THRESHOLD:
+        # Early exit: treat headline decision as authoritative
+        state.need_llm = False
+        state.judge_json = {
+            "action": result.action,
+            "categories": result.flags,
+            "severity": "medium" if result.action == "block" else "low",
+            "rationale": "headline_agent_decision",
+            "confidence": result.confidence,
+            "is_harmful": result.action != "allow",
+        }
+        state.confidence = result.confidence
+    log_step(
+        "headline_layer",
+        state.event,
+        {
+            "action": state.headline_result["action"],
+            "risk": state.headline_result["risk"],
+            "confidence": state.headline_result["confidence"],
+            "flags": state.headline_result["flags"],
+        },
+    )
     return state
 
-def node_llm_judge(state: MonitorState) -> MonitorState:
-    e = state.event
-    data = {}
-    if e.get("data_json"):
-        try: data = json.loads(e["data_json"])
-        except Exception: data = {}
-    text = data.get("dom_sample") or data.get("text") or ""
-    title = e.get("title") or ""
-    domain = (urlparse(e.get("url") or "").netloc or "").lower()
-    out = judge.judge(title, domain, state.fast_scores, text)
-    state.judge_json = out
+
+def node_url_layer(state: MonitorState) -> MonitorState:
+    if not state.need_llm:
+        return state
+    result = url_agent.run(
+        state.event,
+        state.child_profile,
+        extra_text=state.ocr_text,
+        fast_scores=state.fast_scores or None,
+    )
+    state.fast_scores = result.fast_scores
+    state.judge_json = result.llm_decision
+    state.confidence = result.confidence
+    state.need_ocr = result.confidence < settings.ocr_confidence_threshold
+    log_step(
+        "url_metadata_layer",
+        state.event,
+        {"llm_decision": result.llm_decision, "confidence": result.confidence},
+    )
     return state
 
-# Graph: START -> fast_scores -> llm_judge -> END
+
+def node_ocr_layer(state: MonitorState) -> MonitorState:
+    state.needs_screenshot = False
+    if not state.need_llm or not state.need_ocr:
+        return state
+
+    screenshots = screens_agent.get_screenshots(state.event)
+    if not screenshots:
+        state.needs_screenshot = True
+        return state
+
+    ocr_text = ocr_agent.extract_text(screenshots)
+    if not ocr_text:
+        return state
+
+    state.ocr_text = ocr_text
+    refreshed = url_agent.run(
+        state.event,
+        state.child_profile,
+        extra_text=ocr_text,
+        fast_scores=state.fast_scores or None,
+    )
+    state.fast_scores = refreshed.fast_scores
+    state.judge_json = refreshed.llm_decision
+    state.confidence = refreshed.confidence
+    state.need_ocr = False
+    log_step(
+        "ocr_layer",
+        state.event,
+        {"ocr_text_preview": ocr_text[:200], "llm_decision": refreshed.llm_decision, "confidence": refreshed.confidence},
+    )
+    return state
+
+
 graph = StateGraph(MonitorState)
-graph.add_node("fast_scores", node_fast_scores)
-graph.add_node("llm_judge", node_llm_judge)
-graph.add_edge(START, "fast_scores")
-graph.add_edge("fast_scores", "llm_judge")
-graph.add_edge("llm_judge", END)
+graph.add_node("headline_layer", node_headline_layer)
+graph.add_node("url_layer", node_url_layer)
+graph.add_node("ocr_layer", node_ocr_layer)
+graph.add_edge(START, "headline_layer")
+graph.add_edge("headline_layer", "url_layer")
+graph.add_edge("url_layer", "ocr_layer")
+graph.add_edge("ocr_layer", END)
 app_graph = graph.compile()

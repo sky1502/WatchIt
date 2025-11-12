@@ -34,15 +34,27 @@ def _paused_until() -> int | None:
     try: return int(row[0])
     except: return None
 
+STRICTNESS_THRESHOLDS = {
+    "lenient": {"block": 0.95},
+    "standard": {"block": 0.9},
+    "strict": {"block": 0.8},
+}
+
+
 class PolicyEngine:
     def __init__(self):
         self.policy_version = settings.policy_version
         self.allow_domains = {"wikipedia.org", "khanacademy.org", ".edu"}
         self.block_domains = {"pornhub.com", "xvideos.com", "redtube.com"}
-        self.block_threshold = 0.9
-        self.warn_threshold  = 0.75
 
-    def decide(self, event: Dict[str, Any], fast_scores: Dict[str, float], judge_json: Dict[str, Any]) -> Dict[str, Any]:
+    def decide(
+        self,
+        event: Dict[str, Any],
+        fast_scores: Dict[str, float],
+        judge_json: Dict[str, Any],
+        child_profile: Dict[str, Any] | None = None,
+        headline_result: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
         # Global pause check
         now_ms = int(datetime.now().timestamp()*1000)
         paused = _paused_until()
@@ -72,15 +84,30 @@ class PolicyEngine:
                 return {"action":"block","reason":f"blocklist {b}","categories":["adult"]}
 
         # deterministic thresholds
-        if fast_scores.get("sexual",0)>=self.block_threshold:
-            return {"action":"block","reason":"sexual score high","categories":["sexual"]}
-        if fast_scores.get("violence",0)>=self.warn_threshold or fast_scores.get("profanity",0)>=self.warn_threshold:
-            cats=[c for c in ("violence","profanity") if fast_scores.get(c,0)>=self.warn_threshold]
-            return {"action":"warn","reason":"prefilter high", "categories":cats}
+        strictness = ((child_profile or {}).get("strictness") or "standard").lower()
+        if strictness not in STRICTNESS_THRESHOLDS:
+            strictness = "standard"
+        thresholds = STRICTNESS_THRESHOLDS.get(strictness, STRICTNESS_THRESHOLDS["standard"])
+        block_threshold = thresholds["block"]
+
+        if (
+            fast_scores.get("sexual",0)>=block_threshold
+            or fast_scores.get("violence",0)>=block_threshold
+            or fast_scores.get("profanity",0)>=block_threshold
+        ):
+            cats=[c for c in ("sexual","violence","profanity") if fast_scores.get(c,0)>=block_threshold]
+            return {"action":"block","reason":"prefilter high","categories":cats}
+
+        if headline_result:
+            risk = headline_result.get("risk")
+            if risk == "high":
+                return {"action":"block","reason":"headline high risk", "categories":["headline"]}
 
         # LLM judge
         if judge_json:
             act = judge_json.get("action","allow")
+            if act not in ("allow","block"):
+                act = "block"
             cats = judge_json.get("categories",[])
             sev  = judge_json.get("severity","low")
             reason = f"llm:{sev}"

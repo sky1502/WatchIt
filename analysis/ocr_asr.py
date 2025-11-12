@@ -1,33 +1,31 @@
 from __future__ import annotations
-import io, json, base64
-from typing import Dict, Any, Optional, Tuple, List
+import io, base64
+from typing import Optional
 from PIL import Image
-import pytesseract
-from faster_whisper import WhisperModel
+from paddleocr import PaddleOCR
+import numpy as np
 
-from core.config import settings
+_OCR: Optional[PaddleOCR] = None
 
-_whisper: Optional[WhisperModel] = None
-def _get_whisper():
-    global _whisper
-    if _whisper is None:
-        _whisper = WhisperModel(settings.whisper_model, device="auto", compute_type="int8")
-    return _whisper
+def _get_ocr() -> PaddleOCR:
+    global _OCR
+    if _OCR is None:
+        _OCR = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
+    return _OCR
 
-def ocr_image_b64(b64: str, lang: str = "eng") -> str:
+def ocr_image_b64(b64: str) -> str:
     raw = base64.b64decode(b64)
     img = Image.open(io.BytesIO(raw)).convert("RGB")
-    text = pytesseract.image_to_string(img, lang=lang)
-    return text.strip()
-
-def asr_audio_b64(b64: str) -> str:
-    # Expect a short WAV/MP3/MP4 chunk base64; faster-whisper supports file path or audio array.
-    # For simplicity, write to temp buffer.
-    import tempfile
-    raw = base64.b64decode(b64)
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
-        f.write(raw); f.flush()
-        model = _get_whisper()
-        segments, info = model.transcribe(f.name, beam_size=1, vad_filter=True)
-        text = " ".join(seg.text.strip() for seg in segments if seg.text)
-        return text.strip()
+    arr = np.array(img)
+    ocr = _get_ocr()
+    res = ocr.ocr(arr, cls=True)
+    lines = []
+    for page in res or []:
+        for it in page or []:
+            try:
+                txt = it[1][0]
+            except Exception:
+                txt = None
+            if txt:
+                lines.append(txt)
+    return " ".join(lines).strip()
