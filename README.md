@@ -196,6 +196,8 @@ Once authenticated the dashboard:
 - Streams in fresh decisions via SSE for real-time awareness.
 - Exposes PIN-based pause/resume plus per-child controls for **strictness** (lenient,
   standard, strict) and **child age** that immediately influence the LLM prompt/policy.
+- Saving child settings automatically promotes that profile to the **active** child used by the
+  backend, so you can switch monitoring between children without editing the browser extension.
 
 ### Chrome/Chromium extension
 1. Ensure the FastAPI backend is running and reachable (match the host/port in the steps below).
@@ -210,6 +212,9 @@ Once authenticated the dashboard:
    and posts it to `${API}/v1/event/upgrade`.
 6. The content script (`content.js`) listens for those decisions and renders warnings, blur effects,
    or a blocking interstitial.
+7. To archive the captured screenshots for later review, set `WATCHIT_SAVE_SCREENSHOTS=true`
+   (they default to staying in-memory only). Screenshots will be written under
+   `WATCHIT_SCREENSHOT_DIR` without delaying policy decisions.
 
 ### Postgres replicator (optional)
 Need a centralized datastore while keeping the low-latency local path? Use
@@ -250,6 +255,8 @@ the complete list):
 | `WATCHIT_OLLAMA_MODEL` | LLM used by the judge | `qwen2.5:7b-instruct-q4_K_M` |
 | `WATCHIT_ENABLE_OCR` | Enable screenshot parsing via PaddleOCR | `true` |
 | `WATCHIT_OCR_CONFIDENCE_THRESHOLD` | Confidence cut-off (0-1) before OCR upgrade required | `0.7` |
+| `WATCHIT_SAVE_SCREENSHOTS` | Persist captured screenshots to disk for later review | `false` |
+| `WATCHIT_SCREENSHOT_DIR` | Folder (relative to repo or absolute path) used when saving screenshots | `screenshots` |
 | `WATCHIT_PG_DSN` | Postgres connection string for mirrored data | _unset_ |
 
 Dashboard env vars (`ui/.env.local`) control Firebase authentication for the web dashboard:

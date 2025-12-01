@@ -1,11 +1,14 @@
 from __future__ import annotations
 import asyncio
+import json
+import logging
 from typing import Dict, Any
 from core.db import db
 from core.config import settings
 from core.activity_logger import log_step
 from analysis.graph import app_graph, MonitorState
 from policy.engine import PolicyEngine
+from core.screenshot_store import persist_screenshots_async
 
 class DecisionBus:
     def __init__(self):
@@ -25,8 +28,55 @@ class DecisionBus:
 
 bus = DecisionBus()
 policy = PolicyEngine()
+logger = logging.getLogger("watchit.bootstrap")
+
+
+def _extract_screenshots(event: Dict[str, Any]) -> list[str]:
+    payload = event.get("data_json")
+    if not payload:
+        return []
+    try:
+        parsed = json.loads(payload) or {}
+    except Exception:
+        return []
+    shots = parsed.get("screenshots_b64")
+    if not isinstance(shots, list):
+        return []
+    return [s for s in shots if isinstance(s, str) and s]
+
+
+def _schedule_screenshot_save(event_id: str, event: Dict[str, Any]) -> None:
+    if not settings.save_screenshots:
+        return
+    screenshots = _extract_screenshots(event)
+    if not screenshots:
+        return
+    metadata = {
+        "event_id": event_id,
+        "child_id": event.get("child_id"),
+        "ts": event.get("ts"),
+        "url": event.get("url"),
+        "title": event.get("title"),
+        "kind": event.get("kind"),
+    }
+
+    async def _runner():
+        await persist_screenshots_async(event_id, screenshots, metadata)
+
+    task = asyncio.create_task(_runner())
+
+    def _finished(t: asyncio.Task) -> None:
+        try:
+            t.result()
+        except Exception:
+            logger.exception("Screenshot persistence task failed for event %s", event_id)
+
+    task.add_done_callback(_finished)
 
 async def process_event(event: Dict[str, Any], *, upgrade: bool = False) -> Dict[str, Any]:
+    active_child = db.get_active_child_id()
+    if active_child:
+        event["child_id"] = active_child
     event_id = event.get("id")
     if not upgrade or not event_id:
         event_id = db.add_event(event)
@@ -42,6 +92,7 @@ async def process_event(event: Dict[str, Any], *, upgrade: bool = False) -> Dict
     if not profile:
         profile = {"id": child_id or "child_default", "strictness": "standard", "age": 12}
 
+    _schedule_screenshot_save(str(event_id), event)
     log_step("event_received", event, {"upgrade": upgrade})
     state = MonitorState(event=event, child_profile=profile)
     state = MonitorState(**app_graph.invoke(state))

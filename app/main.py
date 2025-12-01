@@ -129,7 +129,7 @@ async def list_children():
         children = pg.fetch_children()
     except Exception as e:
         raise HTTPException(503, f"Postgres unavailable: {e}")
-    return {"children": children}
+    return {"children": children, "active_child_id": db.get_active_child_id()}
 
 @app.post("/v1/children/{child_id}/settings")
 async def update_child(child_id: str, payload: ChildSettingsPayload):
@@ -140,6 +140,7 @@ async def update_child(child_id: str, payload: ChildSettingsPayload):
     db.add_child_profile(child_id)
     db.update_child_profile(child_id, strictness=payload.strictness, age=payload.age)
     profile = db.get_child_profile(child_id) or {}
+    db.set_active_child_id(child_id)
     if settings.pg_dsn:
         try:
             pg.upsert_child(child_id, strictness=payload.strictness, age=payload.age)

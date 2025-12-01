@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { getAuth, GoogleAuthProvider, onAuthStateChanged, signInWithPopup, signOut, User } from "firebase/auth";
 import firebaseApp from "../lib/firebase";
 
@@ -18,6 +18,12 @@ export default function Home() {
   const [childSettings, setChildSettings] = useState<Record<string, { strictness: string; age: number }>>({});
   const [selectedChild, setSelectedChild] = useState<string | null>(null);
   const [savingChild, setSavingChild] = useState(false);
+  const [activeChildId, setActiveChildId] = useState<string | null>(null);
+  const [newChildId, setNewChildId] = useState("");
+  const [newChildAge, setNewChildAge] = useState(12);
+  const [newChildStrictness, setNewChildStrictness] = useState("standard");
+  const [creatingChild, setCreatingChild] = useState(false);
+  const [childFormError, setChildFormError] = useState<string | null>(null);
   const esRef = useRef<EventSource | null>(null);
 
   useEffect(() => {
@@ -29,6 +35,7 @@ export default function Home() {
         setChildren([]);
         setChildSettings({});
         setSelectedChild(null);
+        setActiveChildId(null);
         if (esRef.current) {
           esRef.current.close();
           esRef.current = null;
@@ -65,38 +72,43 @@ export default function Home() {
     };
   }, [user]);
 
-  useEffect(() => {
+  const refreshChildren = useCallback(async () => {
     if (!user) return;
-    let cancelled = false;
-    fetch(`${API}/v1/children`)
-      .then((r) => r.json())
-      .then((j) => {
-        if (cancelled) return;
-        const list = j.children || [];
-        setChildren(list);
-        const map: Record<string, { strictness: string; age: number }> = {};
-        list.forEach((child: any) => {
-          map[child.id] = {
-            strictness: child.strictness || "standard",
-            age: child.age || 12,
-          };
-        });
-        setChildSettings(map);
-        setSelectedChild((prev) => {
-          if (!list.length) {
-            return null;
-          }
-          if (!prev || !list.some((child: any) => child.id === prev)) {
-            return list[0].id;
-          }
-          return prev;
-        });
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
+    try {
+      const resp = await fetch(`${API}/v1/children`);
+      const j = await resp.json();
+      const list = j.children || [];
+      const activeId = j.active_child_id || null;
+      setChildren(list);
+      const map: Record<string, { strictness: string; age: number }> = {};
+      list.forEach((child: any) => {
+        map[child.id] = {
+          strictness: child.strictness || "standard",
+          age: child.age || 12,
+        };
+      });
+      setChildSettings(map);
+      setActiveChildId(activeId);
+      setSelectedChild((prev) => {
+        if (!list.length) {
+          return null;
+        }
+        if (activeId && list.some((child: any) => child.id === activeId)) {
+          return activeId;
+        }
+        if (!prev || !list.some((child: any) => child.id === prev)) {
+          return list[0].id;
+        }
+        return prev;
+      });
+    } catch (err) {
+      // ignore network errors for now
+    }
   }, [user]);
+
+  useEffect(() => {
+    refreshChildren();
+  }, [refreshChildren]);
 
   const currentChild = selectedChild ? childSettings[selectedChild] : null;
 
@@ -107,6 +119,8 @@ export default function Home() {
       body: JSON.stringify({ pin, minutes }),
     });
   };
+
+  const clampAge = (value: string) => Math.min(18, Math.max(3, parseInt(value || "0", 10) || 3));
   const resume = async () => {
     await fetch(`${API}/v1/control/resume`, {
       method: "POST",
@@ -131,7 +145,7 @@ export default function Home() {
         ...(prev[selectedChild] || { strictness: "standard", age: 12 }),
         [field]:
           field === "age"
-            ? Math.min(18, Math.max(3, parseInt(value || "0", 10) || 3))
+            ? clampAge(value)
             : value,
       },
     }));
@@ -149,8 +163,38 @@ export default function Home() {
           age: currentChild.age,
         }),
       });
+      await refreshChildren();
     } finally {
       setSavingChild(false);
+    }
+  };
+
+  const handleCreateChild = async () => {
+    const trimmedId = newChildId.trim();
+    if (!trimmedId) {
+      setChildFormError("Child ID is required.");
+      return;
+    }
+    setChildFormError(null);
+    setCreatingChild(true);
+    try {
+      await fetch(`${API}/v1/children/${encodeURIComponent(trimmedId)}/settings`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          strictness: newChildStrictness,
+          age: newChildAge,
+        }),
+      });
+      setNewChildId("");
+      setNewChildAge(12);
+      setNewChildStrictness("standard");
+      await refreshChildren();
+      setSelectedChild(trimmedId);
+    } catch (err) {
+      setChildFormError("Failed to create child profile.");
+    } finally {
+      setCreatingChild(false);
     }
   };
 
@@ -244,6 +288,23 @@ export default function Home() {
 
           <div style={{ background: "rgba(15,23,42,.85)", borderRadius: 20, padding: 24, border: "1px solid rgba(148,163,184,.2)", boxShadow: "0 10px 40px rgba(8,15,40,.35)" }}>
             <h2 style={{ margin: 0, fontSize: 18 }}>Child Profile Controls</h2>
+            <p style={{ marginTop: 6, color: "#94a3b8", fontSize: 13 }}>
+              Active profile: <strong style={{ color: "#e2e8f0" }}>{activeChildId || "None"}</strong>
+            </p>
+            <div style={{ marginTop: 16, padding: 16, borderRadius: 16, background: "rgba(8,15,40,.6)", border: "1px dashed rgba(148,163,184,.3)", display: "flex", flexDirection: "column", gap: 12 }}>
+              <h3 style={{ margin: 0, fontSize: 15, color: "#cbd5f5" }}>Add Child Profile</h3>
+              <input placeholder="Child ID (e.g. child_alex)" value={newChildId} onChange={(e) => setNewChildId(e.target.value)} style={{ padding: "10px 12px", borderRadius: 12, border: "1px solid rgba(148,163,184,.3)", background: "rgba(15,23,42,.6)", color: "#e2e8f0" }} />
+              <select value={newChildStrictness} onChange={(e) => setNewChildStrictness(e.target.value)} style={{ padding: "10px 12px", borderRadius: 12, border: "1px solid rgba(148,163,184,.3)", background: "rgba(15,23,42,.6)", color: "#e2e8f0" }}>
+                <option value="lenient">Lenient</option>
+                <option value="standard">Standard</option>
+                <option value="strict">Strict</option>
+              </select>
+              <input type="number" min={3} max={18} value={newChildAge} onChange={(e) => setNewChildAge(clampAge(e.target.value))} style={{ padding: "10px 12px", borderRadius: 12, border: "1px solid rgba(148,163,184,.3)", background: "rgba(15,23,42,.6)", color: "#e2e8f0" }} />
+              {childFormError && <p style={{ margin: 0, color: "#f87171", fontSize: 13 }}>{childFormError}</p>}
+              <button onClick={handleCreateChild} disabled={creatingChild} style={{ padding: "10px 0", borderRadius: 12, border: "none", background: "#10b981", color: "#fff", fontWeight: 600, cursor: "pointer" }}>
+                {creatingChild ? "Creating..." : "Add child"}
+              </button>
+            </div>
             {children.length === 0 ? (
               <p style={{ color: "#94a3b8", marginTop: 16 }}>No child profiles synced yet.</p>
             ) : (

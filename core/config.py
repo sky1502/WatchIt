@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     # Features
     enable_ocr: bool = Field(default=True, alias="WATCHIT_ENABLE_OCR")
     ocr_confidence_threshold: float = Field(default=0.7, alias="WATCHIT_OCR_CONFIDENCE_THRESHOLD")
+    save_screenshots: bool = Field(default=False, alias="WATCHIT_SAVE_SCREENSHOTS")
+    screenshots_dir: str = Field(default="screenshots", alias="WATCHIT_SCREENSHOT_DIR")
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True, extra="ignore")
 

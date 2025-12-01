@@ -186,6 +186,21 @@ class Database:
         cols = [c[0] for c in cur.description]
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
+    def get_active_child_id(self) -> Optional[str]:
+        cur = self.conn.cursor()
+        cur.execute("SELECT value FROM settings WHERE key='active_child_id'")
+        row = cur.fetchone()
+        return row[0] if row else None
+
+    def set_active_child_id(self, child_id: str) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            "INSERT INTO settings(key,value) VALUES('active_child_id', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (child_id,),
+        )
+        self.conn.commit()
+
 db = Database()
 db.connect()
 db.init_schema()
