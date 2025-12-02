@@ -4,9 +4,21 @@ import { getAuth, GoogleAuthProvider, onAuthStateChanged, signInWithPopup, signO
 import firebaseApp from "../lib/firebase";
 
 const API = "http://127.0.0.1:4849";
+const ACTION_OPTIONS = ["allow", "warn", "blur", "block", "notify"];
 const auth = getAuth(firebaseApp);
 const provider = new GoogleAuthProvider();
 provider.setCustomParameters({ prompt: "select_account" });
+
+function normalizeDecision(data: any) {
+  if (!data) return data;
+  const categories = data.categories || data.details_json?.categories || [];
+  return {
+    ...data,
+    categories,
+    id: data.id || data.decision_id,
+    manual_flagged: Boolean(data.manual_flagged),
+  };
+}
 
 export default function Home() {
   const [decisions, setDecisions] = useState<any[]>([]);
@@ -24,6 +36,7 @@ export default function Home() {
   const [newChildStrictness, setNewChildStrictness] = useState("standard");
   const [creatingChild, setCreatingChild] = useState(false);
   const [childFormError, setChildFormError] = useState<string | null>(null);
+  const [decisionSaving, setDecisionSaving] = useState<Record<string, boolean>>({});
   const esRef = useRef<EventSource | null>(null);
 
   useEffect(() => {
@@ -52,15 +65,23 @@ export default function Home() {
     fetch(`${API}/v1/decisions?limit=50`)
       .then((r) => r.json())
       .then((j) => {
-        if (!cancelled) setDecisions(j.decisions || []);
+        if (!cancelled) setDecisions((j.decisions || []).map(normalizeDecision));
       })
       .catch(() => {});
 
     const es = new EventSource(`${API}/v1/stream/decisions`);
     es.onmessage = (e) => {
       try {
-        const msg = JSON.parse(e.data);
-        setDecisions((prev) => [msg, ...prev].slice(0, 200));
+        const msg = normalizeDecision(JSON.parse(e.data));
+        setDecisions((prev) => {
+          const idx = prev.findIndex((d) => d.id === msg.id);
+          if (idx >= 0) {
+            const clone = [...prev];
+            clone[idx] = { ...clone[idx], ...msg };
+            return clone;
+          }
+          return [msg, ...prev].slice(0, 200);
+        });
       } catch {}
     };
     es.onerror = () => {};
@@ -195,6 +216,40 @@ export default function Home() {
       setChildFormError("Failed to create child profile.");
     } finally {
       setCreatingChild(false);
+    }
+  };
+
+  const handleDecisionOverride = async (decisionId: string, action: string) => {
+    if (!decisionId) return;
+    setDecisionSaving((prev) => ({ ...prev, [decisionId]: true }));
+    try {
+      const resp = await fetch(`${API}/v1/decisions/${decisionId}/override`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action }),
+      });
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (data.decision) {
+        const normalized = normalizeDecision(data.decision);
+        setDecisions((prev) => {
+          const idx = prev.findIndex((d) => d.id === normalized.id);
+          if (idx >= 0) {
+            const clone = [...prev];
+            clone[idx] = { ...clone[idx], ...normalized };
+            return clone;
+          }
+          return [normalized, ...prev];
+        });
+      }
+    } catch {
+      // ignore network errors for override
+    } finally {
+      setDecisionSaving((prev) => {
+        const next = { ...prev };
+        delete next[decisionId];
+        return next;
+      });
     }
   };
 
@@ -367,19 +422,32 @@ export default function Home() {
                 </tr>
               </thead>
               <tbody>
-                {decisions.map((d, i) => (
-                  <tr key={i} style={{ borderTop: "1px solid rgba(148,163,184,.15)" }}>
-                    <td style={{ padding: "12px 20px", color: "#e2e8f0" }}>{new Date(Number(d.ts ?? Date.now())).toLocaleTimeString()}</td>
-                    <td style={{ padding: "12px 20px" }}>{actionBadge(d.action)}</td>
-                    <td style={{ padding: "12px 20px", color: "#94a3b8" }}>{d.reason}</td>
-                    <td style={{ padding: "12px 20px", color: "#e2e8f0" }}>{d.title || "—"}</td>
-                    <td style={{ padding: "12px 20px" }}>
-                      <a href={d.url} target="_blank" rel="noreferrer" style={{ color: "#38bdf8" }}>
-                        {d.url || "—"}
-                      </a>
-                    </td>
-                  </tr>
-                ))}
+                {decisions.map((d, i) => {
+                  const isCorrected = d.manual_flagged && d.original_action && d.original_action !== d.action;
+                  return (
+                    <tr key={i} style={{ borderTop: "1px solid rgba(148,163,184,.15)", background: isCorrected ? "rgba(15,118,110,.15)" : undefined }}>
+                      <td style={{ padding: "12px 20px", color: "#e2e8f0" }}>{new Date(Number(d.ts ?? Date.now())).toLocaleTimeString()}</td>
+                      <td style={{ padding: "12px 20px", color: "#e2e8f0", display: "flex", flexDirection: "column", gap: 6 }}>
+                        <select value={d.action} onChange={(e) => handleDecisionOverride(d.id, e.target.value)} disabled={Boolean(decisionSaving[d.id])} style={{ padding: "6px 8px", borderRadius: 8, border: "1px solid rgba(148,163,184,.4)", background: "rgba(15,23,42,.6)", color: "#e2e8f0" }}>
+                          {ACTION_OPTIONS.map((opt) => (
+                            <option value={opt} key={opt}>
+                              {opt}
+                            </option>
+                          ))}
+                        </select>
+                        <span>{actionBadge(d.action)}</span>
+                        {isCorrected && <span style={{ fontSize: 12, color: "#fbbf24" }}>Corrected (was {d.original_action})</span>}
+                      </td>
+                      <td style={{ padding: "12px 20px", color: "#94a3b8" }}>{d.reason}</td>
+                      <td style={{ padding: "12px 20px", color: "#e2e8f0" }}>{d.title || "—"}</td>
+                      <td style={{ padding: "12px 20px" }}>
+                        <a href={d.url} target="_blank" rel="noreferrer" style={{ color: "#38bdf8" }}>
+                          {d.url || "—"}
+                        </a>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

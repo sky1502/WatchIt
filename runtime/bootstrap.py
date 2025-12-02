@@ -2,7 +2,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from core.db import db
 from core.config import settings
 from core.activity_logger import log_step
@@ -73,6 +73,60 @@ def _schedule_screenshot_save(event_id: str, event: Dict[str, Any]) -> None:
 
     task.add_done_callback(_finished)
 
+
+def _format_decision_message(
+    decision_id: str,
+    event: Dict[str, Any],
+    decision_payload: Dict[str, Any],
+    *,
+    confidence: float,
+    need_screenshot: bool,
+    headline_result: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    return {
+        "decision_id": decision_id,
+        "event_id": event.get("id"),
+        **decision_payload,
+        "upgrade": False,
+        "needs_ocr": need_screenshot,
+        "confidence": confidence,
+        "url": event.get("url"),
+        "title": event.get("title"),
+        "headline_agent": headline_result,
+        "ts": event.get("ts"),
+        "child_id": event.get("child_id"),
+        "manual_flagged": False,
+        "manual_action": None,
+        "original_action": decision_payload.get("action"),
+    }
+
+
+def _decision_message_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    details = row.get("details_json") or {}
+    return {
+        "decision_id": row.get("id"),
+        "event_id": row.get("event_id"),
+        "action": row.get("action"),
+        "reason": row.get("reason"),
+        "categories": details.get("categories", []),
+        "upgrade": False,
+        "needs_ocr": False,
+        "confidence": details.get("confidence", 1.0),
+        "url": row.get("url"),
+        "title": row.get("title"),
+        "headline_agent": None,
+        "ts": row.get("ts"),
+        "child_id": row.get("child_id"),
+        "manual_flagged": bool(row.get("manual_flagged")),
+        "manual_action": row.get("manual_action"),
+        "original_action": row.get("original_action") or row.get("action"),
+    }
+
+
+async def publish_decision_row(row: Dict[str, Any]) -> None:
+    message = _decision_message_from_row(row)
+    await bus.publish(message)
+
 async def process_event(event: Dict[str, Any], *, upgrade: bool = False) -> Dict[str, Any]:
     active_child = db.get_active_child_id()
     if active_child:
@@ -107,18 +161,17 @@ async def process_event(event: Dict[str, Any], *, upgrade: bool = False) -> Dict
     need_screenshot = settings.enable_ocr and not upgrade and state.needs_screenshot
 
     decision = policy.decide(event, state.fast_scores, state.judge_json, profile, state.headline_result)
-    db.add_decision(event_id, settings.policy_version, decision["action"], decision["reason"], {"categories": decision.get("categories",[])})
+    decision_id = db.add_decision(event_id, settings.policy_version, decision["action"], decision["reason"], {"categories": decision.get("categories",[]), "confidence": confidence})
 
-    message = {
-        "event_id": event_id,
-        **decision,
-        "upgrade": bool(upgrade),
-        "needs_ocr": need_screenshot,
-        "confidence": confidence,
-        "url": event.get("url"),
-        "title": event.get("title"),
-        "headline_agent": state.headline_result,
-    }
+    message = _format_decision_message(
+        decision_id,
+        event,
+        decision,
+        confidence=confidence,
+        need_screenshot=need_screenshot,
+        headline_result=state.headline_result,
+    )
+    message["upgrade"] = bool(upgrade)
     log_step("decision_finalized", event, {"decision": decision, "confidence": confidence, "headline_agent": state.headline_result})
     await bus.publish(message)
     return message

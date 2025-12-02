@@ -10,8 +10,42 @@ from psycopg.types.json import Json
 
 from core.db import db
 from core.config import settings
+from pathlib import Path
+from datetime import datetime
+import re
 
 log = logging.getLogger("watchit.pg_replicator")
+LOG_DIR = Path(__file__).resolve().parent.parent / "logs" / "postgres_logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+_pg_logger: logging.Logger | None = None
+
+
+def _next_pg_log_path() -> Path:
+    today = datetime.now().strftime("%Y%m%d")
+    pattern = re.compile(rf"{today}_replicator_(\d+)\.log")
+    existing = sorted(LOG_DIR.glob(f"{today}_replicator_*.log"))
+    next_idx = 1
+    for path in existing:
+        m = pattern.match(path.name)
+        if m:
+            next_idx = max(next_idx, int(m.group(1)) + 1)
+    return LOG_DIR / f"{today}_replicator_{next_idx}.log"
+
+
+def _get_pg_logger() -> logging.Logger:
+    global _pg_logger
+    if _pg_logger is not None:
+        return _pg_logger
+    handler = logging.FileHandler(_next_pg_log_path(), encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger = logging.getLogger("watchit.pg_replicator.file")
+    logger.setLevel(logging.INFO)
+    logger.addHandler(handler)
+    logger.propagate = False
+    logger.info("=== New Postgres replicator session log started ===")
+    _pg_logger = logger
+    return logger
 
 
 def _get_setting(key: str) -> Optional[str]:
@@ -54,18 +88,24 @@ class PostgresReplicator:
     async def run_forever(self) -> None:
         """Continuously push new rows to Postgres."""
         log.info("Starting Postgres replicator (interval=%ss, batch=%s)", self.poll_interval, self.batch_size)
+        file_logger = _get_pg_logger()
+        file_logger.info("Starting Postgres replicator (interval=%ss, batch=%s)", self.poll_interval, self.batch_size)
+        print(f"[watchit] Postgres replicator running (poll={self.poll_interval}s, batch={self.batch_size})")
         while not self._stop_event.is_set():
             try:
                 events, decisions, children = self.sync_once()
                 if events or decisions or children:
                     log.info("Synced %s events, %s decisions, %s children", events, decisions, children)
+                    file_logger.info("Synced %s events, %s decisions, %s children", events, decisions, children)
             except Exception:
                 log.exception("Postgres replication failed")
+                file_logger.exception("Postgres replication failed")
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=self.poll_interval)
             except asyncio.TimeoutError:
                 continue
         log.info("Postgres replicator stopped")
+        file_logger.info("Postgres replicator stopped")
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -107,10 +147,20 @@ class PostgresReplicator:
                     action TEXT,
                     reason TEXT,
                     details_json JSONB,
+                    original_action TEXT,
+                    manual_action TEXT,
+                    manual_flagged BOOLEAN DEFAULT FALSE,
+                    manual_processed BOOLEAN DEFAULT FALSE,
+                    manual_updated_at BIGINT,
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 );
                 """
             )
+            cur.execute("ALTER TABLE watchit_decisions ADD COLUMN IF NOT EXISTS original_action TEXT")
+            cur.execute("ALTER TABLE watchit_decisions ADD COLUMN IF NOT EXISTS manual_action TEXT")
+            cur.execute("ALTER TABLE watchit_decisions ADD COLUMN IF NOT EXISTS manual_flagged BOOLEAN DEFAULT FALSE")
+            cur.execute("ALTER TABLE watchit_decisions ADD COLUMN IF NOT EXISTS manual_processed BOOLEAN DEFAULT FALSE")
+            cur.execute("ALTER TABLE watchit_decisions ADD COLUMN IF NOT EXISTS manual_updated_at BIGINT")
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS watchit_children(
@@ -202,7 +252,8 @@ class PostgresReplicator:
         if last_ts is None:
             cur.execute(
                 """
-                SELECT d.id, d.event_id, d.policy_version, d.action, d.reason, d.details_json, e.ts
+                SELECT d.id, d.event_id, d.policy_version, d.action, d.reason, d.details_json, e.ts,
+                       d.original_action, d.manual_action, d.manual_flagged, d.manual_processed, d.manual_updated_at
                 FROM decision d
                 JOIN event e ON e.id = d.event_id
                 ORDER BY e.ts ASC
@@ -213,7 +264,8 @@ class PostgresReplicator:
         else:
             cur.execute(
                 """
-                SELECT d.id, d.event_id, d.policy_version, d.action, d.reason, d.details_json, e.ts
+                SELECT d.id, d.event_id, d.policy_version, d.action, d.reason, d.details_json, e.ts,
+                       d.original_action, d.manual_action, d.manual_flagged, d.manual_processed, d.manual_updated_at
                 FROM decision d
                 JOIN event e ON e.id = d.event_id
                 WHERE e.ts > ?
@@ -234,15 +286,28 @@ class PostgresReplicator:
                 r[3],
                 r[4],
                 Json(self._safe_json(r[5])),
+                r[7],
+                r[8],
+                bool(r[9]),
+                bool(r[10]),
+                r[11],
             )
             for r in rows
         ]
         with conn.cursor() as pg_cur:
             pg_cur.executemany(
                 """
-                INSERT INTO watchit_decisions(id, event_id, policy_version, action, reason, details_json)
-                VALUES (%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (id) DO NOTHING
+                INSERT INTO watchit_decisions(id, event_id, policy_version, action, reason, details_json, original_action, manual_action, manual_flagged, manual_processed, manual_updated_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (id) DO UPDATE SET
+                    action=EXCLUDED.action,
+                    reason=EXCLUDED.reason,
+                    details_json=EXCLUDED.details_json,
+                    original_action=COALESCE(watchit_decisions.original_action, EXCLUDED.original_action),
+                    manual_action=EXCLUDED.manual_action,
+                    manual_flagged=EXCLUDED.manual_flagged,
+                    manual_processed=EXCLUDED.manual_processed,
+                    manual_updated_at=EXCLUDED.manual_updated_at
                 """,
                 payloads,
             )

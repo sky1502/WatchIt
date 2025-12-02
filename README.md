@@ -49,6 +49,9 @@ judge (via Ollama). No cloud calls, no telemetry—everything runs on your machi
    Postgres mirror and lets guardians edit per-child strictness + age to steer the LLM. The
    LLM also returns a confidence score; only when confidence is low do the screenshot/OCR
    agents run.
+6. When guardians correct an allow/block action in the dashboard, the backend records the override
+   and an hourly learning loop distills those corrections into additional guidance that is fed into
+   the LLM judge prompt so similar mistakes are less likely going forward.
 
 ## Agent Architecture
 | Agent | Purpose | Key Tools |
@@ -57,6 +60,7 @@ judge (via Ollama). No cloud calls, no telemetry—everything runs on your machi
 | **URL/Metadata Agent (Layer 2)** | When the first layer is unsure, this agent ingests DOM text/metadata and queries the on-device LLM for a structured verdict tuned to child strictness/age. | SafetyAnalyzer (reused), `ChatOllama` |
 | **Screenshots Agent** | Decides if screenshots are available and whether the browser must capture new ones when the LLM confidence stays low. | Browser extension hooks, event payload metadata |
 | **OCR Agent (Layer 3)** | Runs PaddleOCR on screenshots and feeds the extracted text back through the URL/Metadata agent for a final pass. | `analysis/ocr_asr.py`, PaddleOCR |
+| **Guardian Feedback Loop** | Periodically inspects manual overrides to infer guardian intent and injects summary guidance back into future prompts. | `runtime/guardian_learning.py`, Ollama |
 
 Each agent writes its findings into the `MonitorState`, and the policy engine consumes the combined view before publishing the final action.
 
@@ -198,6 +202,9 @@ Once authenticated the dashboard:
   standard, strict) and **child age** that immediately influence the LLM prompt/policy.
 - Saving child settings automatically promotes that profile to the **active** child used by the
   backend, so you can switch monitoring between children without editing the browser extension.
+- Every recent decision has a manual override dropdown (allow/warn/blur/block/notify). Changing
+  it flags the decision, updates the SQLite/Postgres record, and pushes the correction back over
+  SSE so all clients stay in sync.
 
 ### Chrome/Chromium extension
 1. Ensure the FastAPI backend is running and reachable (match the host/port in the steps below).

@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 from langchain_ollama import ChatOllama
 from langchain.schema import SystemMessage, HumanMessage
 from core.config import settings
+from core.db import db
 import logging
 import re
 import json
@@ -60,7 +61,35 @@ class LLMJudge:
             temperature=0,
         )
         self.logger = logging.getLogger("watchit.llm")
+        self._guardian_cache: Optional[str] = None
 
+
+    def _guardian_guidance(self) -> Optional[str]:
+        raw = db.get_setting("guardian_feedback")
+        if not raw:
+            self._guardian_cache = None
+            return None
+        if raw == self._guardian_cache:
+            try:
+                data = json.loads(raw)
+            except Exception:
+                return raw
+            guidance = data.get("guidance") or ""
+            patterns = data.get("patterns") or []
+            if patterns:
+                guidance = guidance + "\nPatterns: " + "; ".join(patterns[:5])
+            return guidance
+        try:
+            data = json.loads(raw)
+        except Exception:
+            self._guardian_cache = raw
+            return raw
+        self._guardian_cache = raw
+        guidance = data.get("guidance") or ""
+        patterns = data.get("patterns") or []
+        if patterns:
+            guidance = guidance + "\nPatterns: " + "; ".join(patterns[:5])
+        return guidance or None
 
     
     def judge(
@@ -81,6 +110,9 @@ class LLMJudge:
         child_age = max(3, min(18, child_age))
         prompt = build_human_prompt(page_title, domain, fast_scores, text_sample, child_age, strictness)
         system_prompt = SYSTEM_PROMPT_TEMPLATE.format(age=child_age, strictness=strictness)
+        guardian_guidance = self._guardian_guidance()
+        if guardian_guidance:
+            system_prompt += "\nGuardian feedback to prioritize:\n" + guardian_guidance
         msgs = [SystemMessage(content=system_prompt), HumanMessage(content=prompt)]
 
         # Send to Ollama
