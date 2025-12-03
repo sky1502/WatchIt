@@ -23,7 +23,7 @@ function normalizeDecision(data: any) {
 export default function Home() {
   const [decisions, setDecisions] = useState<any[]>([]);
   const [pin, setPin] = useState("");
-  const [minutes, setMinutes] = useState(15);
+  const [minutes, setMinutes] = useState<string>("");
   const [user, setUser] = useState<User | null>(null);
   const [authReady, setAuthReady] = useState(false);
   const [children, setChildren] = useState<any[]>([]);
@@ -37,7 +37,22 @@ export default function Home() {
   const [creatingChild, setCreatingChild] = useState(false);
   const [childFormError, setChildFormError] = useState<string | null>(null);
   const [decisionSaving, setDecisionSaving] = useState<Record<string, boolean>>({});
+  const [isPausedManual, setIsPausedManual] = useState(false);
+  const [pausedUntilMs, setPausedUntilMs] = useState<number | null>(null);
+  const [nowMs, setNowMs] = useState<number>(() => Date.now());
   const esRef = useRef<EventSource | null>(null);
+
+  // Hydrate persisted pause deadline on load
+  useEffect(() => {
+    const stored = localStorage.getItem("paused_until");
+    if (stored) {
+      const val = parseInt(stored, 10);
+      if (!isNaN(val)) {
+        setPausedUntilMs(val);
+        setIsPausedManual(val > Date.now());
+      }
+    }
+  }, []);
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (nextUser) => {
@@ -66,6 +81,10 @@ export default function Home() {
       .then((r) => r.json())
       .then((j) => {
         if (!cancelled) setDecisions((j.decisions || []).map(normalizeDecision));
+        if (!cancelled) {
+          const latest = (j.decisions || []).map(normalizeDecision)[0];
+          setIsPausedManual(latest?.reason === "paused");
+        }
       })
       .catch(() => {});
 
@@ -73,6 +92,7 @@ export default function Home() {
     es.onmessage = (e) => {
       try {
         const msg = normalizeDecision(JSON.parse(e.data));
+        setIsPausedManual(msg?.reason === "paused");
         setDecisions((prev) => {
           const idx = prev.findIndex((d) => d.id === msg.id);
           if (idx >= 0) {
@@ -92,6 +112,13 @@ export default function Home() {
       es.close();
     };
   }, [user]);
+
+  // Live ticker for countdown while paused
+  useEffect(() => {
+    if (!pausedUntilMs) return;
+    const id = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [pausedUntilMs]);
 
   const refreshChildren = useCallback(async () => {
     if (!user) return;
@@ -134,20 +161,49 @@ export default function Home() {
   const currentChild = selectedChild ? childSettings[selectedChild] : null;
 
   const pause = async () => {
-    await fetch(`${API}/v1/control/pause`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ pin, minutes }),
-    });
+    const mins = parseInt(minutes || "0", 10);
+    const payload: any = { pin };
+    if (!isNaN(mins) && mins > 0) {
+      payload.minutes = mins;
+    }
+    try {
+      const resp = await fetch(`${API}/v1/control/pause`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (resp.ok) {
+        const data = await resp.json().catch(() => ({}));
+        const until = Number(data.paused_until || 0);
+        setIsPausedManual(true);
+        if (until > 0) {
+          setPausedUntilMs(until);
+          localStorage.setItem("paused_until", String(until));
+        }
+        setPin("");
+        setMinutes("");
+      }
+    } catch {
+      // ignore network errors
+    }
   };
 
   const clampAge = (value: string) => Math.min(18, Math.max(3, parseInt(value || "0", 10) || 3));
   const resume = async () => {
-    await fetch(`${API}/v1/control/resume`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ pin }),
-    });
+    try {
+      const resp = await fetch(`${API}/v1/control/resume`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      if (resp.ok) {
+        setIsPausedManual(false);
+        setPausedUntilMs(null);
+        localStorage.removeItem("paused_until");
+      }
+    } catch {
+      // ignore network errors
+    }
   };
 
   const signIn = async () => {
@@ -281,6 +337,18 @@ export default function Home() {
     const today = new Date();
     return date.toDateString() === today.toDateString();
   }).length;
+  const isPaused = isPausedManual || latest?.reason === "paused";
+  const timeLeftMs = pausedUntilMs ? Math.max(0, pausedUntilMs - nowMs) : 0;
+  const formatCountdown = (ms: number) => {
+    if (ms <= 0) return "0s";
+    const totalSec = Math.floor(ms / 1000);
+    const h = Math.floor(totalSec / 3600);
+    const m = Math.floor((totalSec % 3600) / 60);
+    const s = totalSec % 60;
+    if (h > 0) return `${h}h ${m}m ${s}s`;
+    if (m > 0) return `${m}m ${s}s`;
+    return `${s}s`;
+  };
   const actionBadge = (action: string) => {
     const palette: Record<string, string> = {
       allow: "#22c55e",
@@ -321,7 +389,32 @@ export default function Home() {
           </div>
           <div style={{ background: "rgba(15,23,42,.8)", borderRadius: 20, padding: 20, border: "1px solid rgba(148,163,184,.2)" }}>
             <p style={{ margin: 0, color: "#94a3b8", fontSize: 13 }}>Stream</p>
-            <p style={{ marginTop: 12, color: "#34d399", fontWeight: 600 }}>Live</p>
+            <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+              <span style={{ color: isPaused ? "#f87171" : "#34d399", fontWeight: 600 }}>
+                {isPaused ? "Paused" : "Live"}
+              </span>
+              {isPaused && (
+                <span style={{ color: "#cbd5f5", fontSize: 13 }}>
+                  {pausedUntilMs ? `Resumes in ${formatCountdown(timeLeftMs)}` : "Paused indefinitely"}
+                </span>
+              )}
+              {isPaused && (
+                <button
+                  onClick={resume}
+                  style={{
+                    padding: "6px 12px",
+                    borderRadius: 10,
+                    border: "1px solid rgba(148,163,184,.4)",
+                    background: "transparent",
+                    color: "#e2e8f0",
+                    fontWeight: 600,
+                    cursor: "pointer",
+                  }}
+                >
+                  Resume
+                </button>
+              )}
+            </div>
           </div>
         </section>
 
@@ -333,10 +426,16 @@ export default function Home() {
             </div>
             <div style={{ marginTop: 16, display: "flex", flexDirection: "column", gap: 14 }}>
               <input placeholder="Parent PIN" value={pin} onChange={(e) => setPin(e.target.value)} style={{ padding: "10px 12px", borderRadius: 12, border: "1px solid rgba(148,163,184,.3)", background: "rgba(15,23,42,.6)", color: "#e2e8f0" }} />
-              <input type="number" min={1} value={minutes} onChange={(e) => setMinutes(parseInt(e.target.value || "15"))} style={{ padding: "10px 12px", borderRadius: 12, border: "1px solid rgba(148,163,184,.3)", background: "rgba(15,23,42,.6)", color: "#e2e8f0" }} />
+              <input
+                type="number"
+                min={1}
+                placeholder="Leave blank for indefinite"
+                value={minutes}
+                onChange={(e) => setMinutes(e.target.value)}
+                style={{ padding: "10px 12px", borderRadius: 12, border: "1px solid rgba(148,163,184,.3)", background: "rgba(15,23,42,.6)", color: "#e2e8f0" }}
+              />
               <div style={{ display: "flex", gap: 12 }}>
                 <button onClick={pause} style={{ flex: 1, padding: "10px 0", borderRadius: 12, border: "none", background: "#f97316", color: "#fff", fontWeight: 600, cursor: "pointer" }}>Pause</button>
-                <button onClick={resume} style={{ flex: 1, padding: "10px 0", borderRadius: 12, border: "1px solid rgba(148,163,184,.4)", background: "transparent", color: "#e2e8f0", fontWeight: 600, cursor: "pointer" }}>Resume</button>
               </div>
             </div>
           </div>

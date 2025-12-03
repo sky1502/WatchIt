@@ -47,27 +47,27 @@ def log_step(step: str, event: Dict[str, Any], details: Dict[str, Any] | None = 
     title = event.get("title") or ""
     payload = details or {}
     try:
-        extra = json.dumps(payload, ensure_ascii=False, default=str)
+        extra = json.dumps(payload, ensure_ascii=False, default=str, indent=2)
     except Exception:
         extra = str(payload)
-    logger.info("step=%s url=%s title=%s details=%s", step, url, title, extra[:4000])
+    logger.info("step=%s\nurl=%s\ntitle=%s\nDETAILS:\n%s\n", step, url, title, extra[:4000])
 
 
 def log_service_event(event: str, details: Dict[str, Any] | None = None) -> None:
     logger = _get_logger()
     payload = details or {}
     try:
-        extra = json.dumps(payload, ensure_ascii=False, default=str)
+        extra = json.dumps(payload, ensure_ascii=False, default=str, indent=2)
     except Exception:
         extra = str(payload)
-    logger.info("service=%s details=%s", event, extra[:4000])
+    logger.info("service=%s\nDETAILS:\n%s\n", event, extra[:4000])
 
 
 def log_service_shutdown(details: Dict[str, Any] | None = None) -> None:
     logger = _get_logger()
     payload = details or {}
     try:
-        extra = json.dumps(payload, ensure_ascii=False, default=str)
+        extra = json.dumps(payload, ensure_ascii=False, default=str, indent=2)
     except Exception:
         extra = str(payload)
-    logger.info("=== Service shutdown === details=%s", extra[:4000])
+    logger.info("=== Service shutdown ===\nDETAILS:\n%s\n", extra[:4000])

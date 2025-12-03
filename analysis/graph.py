@@ -82,7 +82,15 @@ def node_url_layer(state: MonitorState) -> MonitorState:
     state.fast_scores = result.fast_scores
     state.judge_json = result.llm_decision
     state.confidence = result.confidence
-    state.need_ocr = result.confidence < settings.ocr_confidence_threshold
+    # Treat any low-confidence or non-allow verdict as uncertain and trigger OCR.
+    llm_action = (result.llm_decision or {}).get("action", "").lower()
+    llm_severity = (result.llm_decision or {}).get("severity", "").lower()
+    uncertain = (
+        result.confidence < settings.ocr_confidence_threshold
+        or llm_action in {"warn", "blur", "notify"}
+        or llm_severity in {"medium", "high"}
+    )
+    state.need_ocr = uncertain
     log_step(
         "url_metadata_layer",
         state.event,
@@ -99,10 +107,27 @@ def node_ocr_layer(state: MonitorState) -> MonitorState:
     screenshots = screens_agent.get_screenshots(state.event)
     if not screenshots:
         state.needs_screenshot = True
+        log_step(
+            "ocr_layer_request_screenshot",
+            state.event,
+            {
+                "reason": "no_screenshots_present",
+                "note": "llm_uncertain_no_screenshot_yet",
+            },
+        )
         return state
 
     ocr_text = ocr_agent.extract_text(screenshots)
     if not ocr_text:
+        log_step(
+            "ocr_layer_no_text",
+            state.event,
+            {
+                "reason": "ocr_empty",
+                "note": "screenshots_received_but_no_text_detected",
+                "screenshot_count": len(screenshots),
+            },
+        )
         return state
 
     state.ocr_text = ocr_text
@@ -119,7 +144,12 @@ def node_ocr_layer(state: MonitorState) -> MonitorState:
     log_step(
         "ocr_layer",
         state.event,
-        {"ocr_text_preview": ocr_text[:200], "llm_decision": refreshed.llm_decision, "confidence": refreshed.confidence},
+        {
+            "ocr_text_preview": ocr_text[:200],
+            "ocr_text_full": ocr_text[:2000],  # log capped full text for debugging
+            "llm_decision": refreshed.llm_decision,
+            "confidence": refreshed.confidence,
+        },
     )
     return state
 

@@ -82,6 +82,7 @@ def _format_decision_message(
     confidence: float,
     need_screenshot: bool,
     headline_result: Dict[str, Any] | None,
+    llm_rationale: str | None,
 ) -> Dict[str, Any]:
     return {
         "decision_id": decision_id,
@@ -98,6 +99,7 @@ def _format_decision_message(
         "manual_flagged": False,
         "manual_action": None,
         "original_action": decision_payload.get("action"),
+        "llm_rationale": llm_rationale,
     }
 
 
@@ -112,6 +114,7 @@ def _decision_message_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "upgrade": False,
         "needs_ocr": False,
         "confidence": details.get("confidence", 1.0),
+        "llm_rationale": details.get("rationale"),
         "url": row.get("url"),
         "title": row.get("title"),
         "headline_agent": None,
@@ -160,8 +163,26 @@ async def process_event(event: Dict[str, Any], *, upgrade: bool = False) -> Dict
     confidence = state.judge_json.get("confidence", 1.0) if state.judge_json else 1.0
     need_screenshot = settings.enable_ocr and not upgrade and state.needs_screenshot
 
-    decision = policy.decide(event, state.fast_scores, state.judge_json, profile, state.headline_result)
-    decision_id = db.add_decision(event_id, settings.policy_version, decision["action"], decision["reason"], {"categories": decision.get("categories",[]), "confidence": confidence})
+    if need_screenshot:
+        # Do not finalize allow/block until OCR upgrade arrives; send a holding warn.
+        decision = {"action": "warn", "reason": "pending_ocr", "categories": []}
+    else:
+        decision = policy.decide(event, state.fast_scores, state.judge_json, profile, state.headline_result)
+    llm_rationale = (state.judge_json or {}).get("rationale")
+    if llm_rationale:
+        decision["llm_rationale"] = llm_rationale
+
+    decision_id = db.add_decision(
+        event_id,
+        settings.policy_version,
+        decision["action"],
+        decision["reason"],
+        {
+            "categories": decision.get("categories", []),
+            "confidence": confidence,
+            **({"rationale": llm_rationale} if llm_rationale else {}),
+        },
+    )
 
     message = _format_decision_message(
         decision_id,
@@ -170,6 +191,7 @@ async def process_event(event: Dict[str, Any], *, upgrade: bool = False) -> Dict
         confidence=confidence,
         need_screenshot=need_screenshot,
         headline_result=state.headline_result,
+        llm_rationale=llm_rationale,
     )
     message["upgrade"] = bool(upgrade)
     log_step("decision_finalized", event, {"decision": decision, "confidence": confidence, "headline_agent": state.headline_result})

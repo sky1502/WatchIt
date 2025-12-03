@@ -58,7 +58,10 @@ class PinPayload(BaseModel):
 
 class PausePayload(BaseModel):
     pin: str
-    minutes: int = 15
+    minutes: Optional[int] = None
+
+class ResumePayload(BaseModel):
+    pin: Optional[str] = None
 
 class UpgradeInput(EventInput):
     id: str  # existing event_id
@@ -133,16 +136,17 @@ async def control_pause(body: PausePayload):
     if body.pin != settings.parent_pin:
         raise HTTPException(403, "Invalid PIN")
     import time
-    until_ms = int(time.time()*1000 + body.minutes*60*1000)
+    # If minutes not provided or <=0, treat as an indefinite pause (10-year horizon).
+    minutes = body.minutes if body.minutes is not None else 0
+    horizon_minutes = minutes if minutes > 0 else 10 * 365 * 24 * 60
+    until_ms = int(time.time()*1000 + horizon_minutes*60*1000)
     cur = db.conn.cursor()
     cur.execute("INSERT INTO settings(key,value) VALUES('paused_until', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(until_ms),))
     db.conn.commit()
     return {"ok": True, "paused_until": until_ms}
 
 @app.post("/v1/control/resume")
-async def control_resume(body: PinPayload):
-    if body.pin != settings.parent_pin:
-        raise HTTPException(403, "Invalid PIN")
+async def control_resume(body: ResumePayload):
     cur = db.conn.cursor()
     cur.execute("DELETE FROM settings WHERE key='paused_until'")
     db.conn.commit()
@@ -180,4 +184,11 @@ async def override_decision(decision_id: str, payload: DecisionOverridePayload):
     if not record:
         raise HTTPException(404, "decision not found")
     await publish_decision_row(record)
+    # Refresh guardian feedback immediately so overrides influence subsequent LLM calls.
+    global _learning_loop
+    if _learning_loop:
+        try:
+            await _learning_loop.process_once()
+        except Exception:
+            logger.exception("Failed to refresh guardian feedback after override")
     return {"decision": record}

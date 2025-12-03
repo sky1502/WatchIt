@@ -5,6 +5,7 @@ import json
 import logging
 import time
 from typing import Any, Dict, List
+import re
 
 from langchain_ollama import ChatOllama
 from langchain.schema import HumanMessage, SystemMessage
@@ -40,10 +41,14 @@ class GuardianLearningLoop:
         if not overrides:
             return
         guidance = await asyncio.to_thread(self._infer_guidance, overrides)
+
+        # Merge with any existing guidance to avoid discarding past insights.
+        merged_guidance, merged_patterns = self._merge_with_existing(guidance)
+
         payload = {
             "generated_at": int(time.time()),
-            "guidance": guidance.get("guidance") if isinstance(guidance, dict) else guidance,
-            "patterns": guidance.get("patterns") if isinstance(guidance, dict) else [],
+            "guidance": merged_guidance,
+            "patterns": merged_patterns,
             "sample_count": len(overrides),
         }
         db.set_setting("guardian_feedback", json.dumps(payload))
@@ -85,3 +90,62 @@ class GuardianLearningLoop:
         except Exception:
             self.logger.warning("Guardian feedback JSON parse failed, returning raw text")
         return {"guidance": raw, "patterns": []}
+
+    def _merge_with_existing(self, new_guidance: Dict[str, Any]) -> tuple[str, List[str]]:
+        """
+        Merge newly inferred guidance with any existing stored guidance.
+        - Guidance text: combine old + new, deduplicate similar sentences, keep concise.
+        - Patterns: set-union of old and new, removing duplicates.
+        """
+        raw_existing = db.get_setting("guardian_feedback")
+        existing_guidance = ""
+        existing_patterns: List[str] = []
+        if raw_existing:
+            try:
+                parsed = json.loads(raw_existing)
+                if isinstance(parsed, dict):
+                    existing_guidance = parsed.get("guidance") or ""
+                    existing_patterns = parsed.get("patterns") or []
+            except Exception:
+                pass
+
+        new_text = new_guidance.get("guidance") if isinstance(new_guidance, dict) else (new_guidance or "")
+        new_patterns = new_guidance.get("patterns") if isinstance(new_guidance, dict) else []
+
+        def dedup_sentences(text: str) -> List[str]:
+            parts = [p.strip() for p in re.split(r"[\\.?!]+", text or "") if p.strip()]
+            seen = set()
+            result = []
+            for p in parts:
+                if p.lower() in seen:
+                    continue
+                seen.add(p.lower())
+                result.append(p)
+            return result
+
+        existing_sents = dedup_sentences(existing_guidance)
+        new_sents = dedup_sentences(new_text)
+        merged_sents = []
+        seen = set()
+        for s in existing_sents + new_sents:
+            key = s.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged_sents.append(s)
+        merged_guidance = ". ".join(merged_sents).strip()
+        if merged_guidance and not merged_guidance.endswith("."):
+            merged_guidance += "."
+
+        merged_patterns = []
+        seen_patterns = set()
+        for p in (existing_patterns or []) + (new_patterns or []):
+            if not isinstance(p, str):
+                continue
+            key = p.strip()
+            if not key or key.lower() in seen_patterns:
+                continue
+            seen_patterns.add(key.lower())
+            merged_patterns.append(key)
+
+        return merged_guidance or (new_text or existing_guidance), merged_patterns

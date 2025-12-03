@@ -252,11 +252,22 @@ class PostgresReplicator:
         if last_ts is None:
             cur.execute(
                 """
-                SELECT d.id, d.event_id, d.policy_version, d.action, d.reason, d.details_json, e.ts,
-                       d.original_action, d.manual_action, d.manual_flagged, d.manual_processed, d.manual_updated_at
+                SELECT d.id,
+                       d.event_id,
+                       d.policy_version,
+                       d.action,
+                       d.reason,
+                       d.details_json,
+                       e.ts,
+                       d.original_action,
+                       d.manual_action,
+                       d.manual_flagged,
+                       d.manual_processed,
+                       d.manual_updated_at,
+                       MAX(e.ts, COALESCE(d.manual_updated_at, 0)) AS sync_ts
                 FROM decision d
                 JOIN event e ON e.id = d.event_id
-                ORDER BY e.ts ASC
+                ORDER BY sync_ts ASC
                 LIMIT ?
                 """,
                 (self.batch_size,),
@@ -264,12 +275,23 @@ class PostgresReplicator:
         else:
             cur.execute(
                 """
-                SELECT d.id, d.event_id, d.policy_version, d.action, d.reason, d.details_json, e.ts,
-                       d.original_action, d.manual_action, d.manual_flagged, d.manual_processed, d.manual_updated_at
+                SELECT d.id,
+                       d.event_id,
+                       d.policy_version,
+                       d.action,
+                       d.reason,
+                       d.details_json,
+                       e.ts,
+                       d.original_action,
+                       d.manual_action,
+                       d.manual_flagged,
+                       d.manual_processed,
+                       d.manual_updated_at,
+                       MAX(e.ts, COALESCE(d.manual_updated_at, 0)) AS sync_ts
                 FROM decision d
                 JOIN event e ON e.id = d.event_id
-                WHERE e.ts > ?
-                ORDER BY e.ts ASC
+                WHERE MAX(e.ts, COALESCE(d.manual_updated_at, 0)) > ?
+                ORDER BY sync_ts ASC
                 LIMIT ?
                 """,
                 (last_ts, self.batch_size),
@@ -311,7 +333,7 @@ class PostgresReplicator:
                 """,
                 payloads,
             )
-        latest_ts = max(r[6] or 0 for r in rows)
+        latest_ts = max(r[12] or 0 for r in rows)
         _set_setting("pg_last_decision_ts", str(latest_ts))
         return len(rows)
 

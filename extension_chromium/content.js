@@ -28,7 +28,14 @@ function block(reason){
 
 chrome.runtime.onMessage.addListener((msg)=>{
   if(!msg || msg.type!=="watchit_decision") return;
-  const d=msg.payload||{}; const a=d.action; const r=d.reason||"policy";
+  const d=msg.payload||{}; const a=d.action;
+  const rationale = d.llm_rationale;
+  const cats=(d.categories||[]).join(", ");
+  const reasonParts=[];
+  if(rationale) reasonParts.push(rationale);
+  if(d.reason) reasonParts.push(d.reason);
+  if(cats) reasonParts.push(`categories: ${cats}`);
+  const r=reasonParts.join(" | ") || "policy";
   clearWarn();
   if(a==="allow"){
     unblur();
