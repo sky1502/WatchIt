@@ -8,7 +8,24 @@ function connectSSE(){
   es.onmessage = (e)=>{
     try{
       const msg = JSON.parse(e.data);
-      chrome.tabs.query({}, tabs => tabs.forEach(t => chrome.tabs.sendMessage(t.id, { type: "watchit_decision", payload: msg })));
+      const targetTabId = msg && msg.tab_id;
+      chrome.tabs.query({}, tabs => {
+        tabs.forEach(t => {
+          // Match by tab_id if provided, else fall back to URL match.
+          const matchByTab = targetTabId && targetTabId === `c-${t.id}`;
+          const matchByUrl = (() => {
+            if (!msg || !msg.url || !t.url) return false;
+            try {
+              const target = new URL(msg.url);
+              const tabUrl = new URL(t.url);
+              return target.origin === tabUrl.origin && tabUrl.href.startsWith((target.href.split('#')[0]));
+            } catch (_){ return false; }
+          })();
+          if (matchByTab || matchByUrl) {
+            chrome.tabs.sendMessage(t.id, { type: "watchit_decision", payload: msg });
+          }
+        });
+      });
     }catch(_){}
   };
   es.onerror = ()=> setTimeout(connectSSE, 1500);

@@ -91,6 +91,7 @@ def _format_decision_message(
         "upgrade": False,
         "needs_ocr": need_screenshot,
         "confidence": confidence,
+        "tab_id": event.get("tab_id"),
         "url": event.get("url"),
         "title": event.get("title"),
         "headline_agent": headline_result,
@@ -108,6 +109,7 @@ def _decision_message_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "decision_id": row.get("id"),
         "event_id": row.get("event_id"),
+        "tab_id": row.get("tab_id"),
         "action": row.get("action"),
         "reason": row.get("reason"),
         "categories": details.get("categories", []),
@@ -151,7 +153,7 @@ async def process_event(event: Dict[str, Any], *, upgrade: bool = False) -> Dict
 
     _schedule_screenshot_save(str(event_id), event)
     log_step("event_received", event, {"upgrade": upgrade})
-    state = MonitorState(event=event, child_profile=profile)
+    state = MonitorState(event=event, child_profile=profile, is_upgrade=upgrade)
     state = MonitorState(**app_graph.invoke(state))
 
     db.add_analysis(event_id, "fast+ocr", "1.0", state.fast_scores, label="")
@@ -163,12 +165,14 @@ async def process_event(event: Dict[str, Any], *, upgrade: bool = False) -> Dict
     confidence = state.judge_json.get("confidence", 1.0) if state.judge_json else 1.0
     need_screenshot = settings.enable_ocr and not upgrade and state.needs_screenshot
 
-    if need_screenshot:
-        # Do not finalize allow/block until OCR upgrade arrives; send a holding warn.
+    if state.final_decision:
+        decision = state.final_decision
+    elif need_screenshot:
         decision = {"action": "warn", "reason": "pending_ocr", "categories": []}
     else:
         decision = policy.decide(event, state.fast_scores, state.judge_json, profile, state.headline_result)
-    llm_rationale = (state.judge_json or {}).get("rationale")
+
+    llm_rationale = decision.get("llm_rationale") or (state.judge_json or {}).get("rationale")
     if llm_rationale:
         decision["llm_rationale"] = llm_rationale
 

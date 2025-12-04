@@ -237,7 +237,7 @@ class Database:
         cur = self.conn.cursor()
         cur.execute(
             """
-            SELECT d.*, e.url, e.title, e.ts, e.child_id
+            SELECT d.*, e.url, e.title, e.ts, e.child_id, e.tab_id
             FROM decision d JOIN event e ON d.event_id=e.id
             WHERE d.id=?
             """,
@@ -339,6 +339,7 @@ class Database:
                 d.manual_flagged,
                 d.manual_processed,
                 d.manual_updated_at,
+                e.tab_id,
                 e.url,
                 e.title,
                 e.ts,

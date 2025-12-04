@@ -36,11 +36,14 @@ judge (via Ollama). No cloud calls, no telemetry—everything runs on your machi
 1. The browser extension emits a `visit` event when navigation commits, including a DOM text
    sample and metadata.
 2. The FastAPI backend (`app/main.py`) stores the event, then runs an **agent pipeline**:
-   - **URL/Metadata Agent** inspects DOM/text, calls the on-device LLM, and emits a decision
-     with confidence tied to the child’s strictness/age.
-   - **Headlines Agent** focuses on titles/headlines to raise or lower risk.
-   - **Screenshot + OCR Agents** collaborate when the confidence is low; the backend tells the
+   - A **Planner Agent** (LangGraph) chooses the next tool dynamically: headline, URL/LLM, OCR,
+     policy, or stop. It enforces one OCR pass per event and skips headlines after OCR or on upgrades.
+   - **Headlines Agent** (optional) focuses on titles/headlines to raise or lower risk.
+   - **URL/Metadata Agent** inspects DOM/text (plus OCR text when present), calls the on-device LLM,
+     and emits a structured decision with confidence tied to the child’s strictness/age.
+   - **Screenshot + OCR Agents** run at most once when confidence is low; the backend tells the
      extension to capture screenshots, and PaddleOCR extracts extra text for a second pass.
+   - **Policy Agent** wraps the policy engine to finalize the action and stop the loop.
 3. The policy engine (`policy/engine.py`) folds in schedules, allow/block lists, agent output,
    and model confidence to produce an action (`allow`, `warn`, `blur`, `block`, `notify`).
 4. Final decisions are published over SSE so the extension and dashboards react instantly.
@@ -53,21 +56,46 @@ judge (via Ollama). No cloud calls, no telemetry—everything runs on your machi
    and an hourly learning loop distills those corrections into additional guidance that is fed into
    the LLM judge prompt so similar mistakes are less likely going forward.
 
-## Agent Architecture
-| Agent | Purpose | Key Tools |
+## Agent Architecture (Agentic, Planner-Driven)
+WatchIt now uses a planner-driven LangGraph instead of a fixed sequence. A `MonitorState` carries all signals while the planner chooses the next tool:
+
+| Agent / Tool | Purpose | Key Files |
 | --- | --- | --- |
-| **Headlines Agent (Layer 1)** | Fast heuristics over URL/title + keyword scores. If confidence is high it can allow/block instantly without waking heavier agents. | SafetyAnalyzer, domain/title keyword lists |
-| **URL/Metadata Agent (Layer 2)** | When the first layer is unsure, this agent ingests DOM text/metadata and queries the on-device LLM for a structured verdict tuned to child strictness/age. | SafetyAnalyzer (reused), `ChatOllama` |
-| **Screenshots Agent** | Decides if screenshots are available and whether the browser must capture new ones when the LLM confidence stays low. | Browser extension hooks, event payload metadata |
-| **OCR Agent (Layer 3)** | Runs PaddleOCR on screenshots and feeds the extracted text back through the URL/Metadata agent for a final pass. | `analysis/ocr_asr.py`, PaddleOCR |
-| **Guardian Feedback Loop** | Periodically inspects manual overrides to infer guardian intent and injects summary guidance back into future prompts. | `runtime/guardian_learning.py`, Ollama |
+| **Planner** | Chooses the next tool (`headline`, `url_llm`, `ocr`, `policy`, `stop`) based on state; forces OCR first on screenshot upgrades; never re-runs OCR/headline after OCR. | `analysis/agents/planner_agent.py`, `analysis/graph.py` |
+| **Headlines Agent** | Fast heuristics over URL/title + keyword scores; can short-circuit to allow/block when confident. Skipped after OCR or on upgrade events. | `analysis/agents/headlines_agent.py` |
+| **URL/Metadata Agent (LLM)** | Ingests DOM/text/OCR and queries the on-device LLM for a structured verdict tuned to child strictness/age. | `analysis/agents/url_agent.py`, `analysis/llm_judge.py` |
+| **Screenshots/OCR Agent** | Runs PaddleOCR once per event to enrich text; never re-run in the same event; upgrades start here. | `analysis/agents/ocr_agent.py`, `analysis/ocr_asr.py` |
+| **Policy Agent** | Wraps `PolicyEngine.decide` to finalize the action and stop the loop. | `analysis/agents/policy_agent.py`, `policy/engine.py` |
+| **Guardian Feedback Loop** | Summarizes manual overrides into cumulative guidance (merged over time) injected into LLM prompts. | `runtime/guardian_learning.py` |
 
-Each agent writes its findings into the `MonitorState`, and the policy engine consumes the combined view before publishing the final action.
+**Dynamic flow**
+- Normal event: planner → headline → planner → url_llm → planner → (optional) ocr → planner → policy → END. OCR runs at most once; headline never runs after OCR.
+- Upgrade event (with screenshots): planner forces ocr first, skips headline; flow: planner → ocr → planner → url_llm → planner → policy → END.
+- Loop protection: planner routes to policy after 5 loops.
 
-**Layered flow**
-1. **Headlines layer** runs immediately—if it’s confident enough, the system blocks/allows without hitting the LLM.
-2. Only when the first layer warns or stays low-confidence does the **URL/Metadata layer** run the LLM. Its confidence determines whether OCR is required.
-3. When the LLM still isn’t sure, the SSE response instructs the extension to capture screenshots so the **Screenshots + OCR layer** can enrich the text and rerun the LLM, after which the policy engine makes the final call.
+**Why this agentic design matters**
+- **Tool-selection brain:** The planner acts like a conductor, activating only the tools needed (headline, URL/LLM, OCR, or policy) and never re-running OCR/headlines after OCR to save time.
+- **Upgrade-aware:** When screenshots arrive, the planner jumps straight to OCR, then LLM, skipping headlines to keep latency down.
+- **Single-pass OCR:** OCR is run at most once per event; the planner and routing guard against repeat OCR to avoid wasted cycles.
+- **Cumulative learning:** Guardian overrides are merged over time into prompt guidance, so the planner/LLM inherit evolving intent without losing history.
+- **LLM prompt hygiene:** Planner state (loop_count, need_ocr, has_ocr_run, is_upgrade), fast scores, OCR text presence, and child profile are serialized into compact JSON for the planner/LLM calls; long text is truncated to keep tokens tight.
+- **Routing determinism:** Conditional edges are enforced in LangGraph; headline/ocr edges are disabled after OCR; upgrade flows pin the first hop to OCR; loop_guard caps at 5 cycles and forces policy.
+- **Full traceability:** Every planner/tool activation logs structured JSON with inputs/outputs/state, giving you a step-by-step audit trail of why a decision was made.
+- **Tab-scoped enforcement:** Decisions carry `tab_id` through SSE; the extension filters by tab_id/origin before applying warn/blur/block, preventing cross-tab blocking.
+- **Logging hygiene:** Session-scoped JSONL logs live under `logs/sessions/YYYYMMDD_session_###.log`, prettified and truncated for long fields; decision finalization inserts a separator for readability.
+
+## Research Abstract & Reproducibility
+- **Abstract (concise):** WatchIt is a local-first, planner-driven safety monitor that combines lightweight heuristics, single-pass OCR, and an on-device LLM (via Ollama) to classify web content for children. A LangGraph planner orchestrates tool use (headline, URL/LLM, OCR, policy), while guardian overrides are merged over time into prompt guidance. Decisions are enforced in-browser via SSE, with full agent-level tracing for auditability.
+- **Reproducibility:** Python 3.11, Node.js 18+, Ollama running locally (model configurable, e.g., `llama3.1`), PaddleOCR enabled by default. Determinism aids: single-pass OCR, capped planner loops (5), truncated text inputs, and fixed prompt shapes. To reproduce: install deps (`requirements.txt`, `ui` `npm install`), run `uvicorn app.main:app` and `npm run dev` in `ui`, load the extension, and navigate to known URLs while capturing logs in `logs/sessions/...`.
+- **Evaluation hooks:** Decisions and agent traces are stored in SQLCipher; Postgres replication available for offline analysis. Structured JSON logs provide per-agent inputs/outputs; screenshots (optional) can be persisted when `WATCHIT_SAVE_SCREENSHOTS=true`.
+
+## Limitations & Ethical Considerations
+- **Threat model limits:** API endpoints are unauthenticated (PIN only for pause); deployment should be constrained to localhost or trusted LAN. SQLCipher key must be secret.
+- **Model bias and drift:** LLM outputs may inherit bias; guardian guidance is global (not per-domain) and could overgeneralize; manual review remains necessary.
+- **OCR constraints:** PaddleOCR may miss stylized text; single-pass OCR avoids loops but can under-detect; screenshots may contain sensitive data—enable disk persistence only if acceptable.
+- **Privacy:** No external calls beyond local Ollama, but screenshots/DOM samples are sensitive; retain only as needed, and secure DB/.env files.
+
+Each agent logs a structured trace with inputs/outputs/state; final decisions still flow through the same API/SSE.
 
 ## Prerequisites
 - Python 3.11 (minimum 3.10).
@@ -309,6 +337,9 @@ Sample event payload:
   on-device.
 - **Policy engine** – `policy/engine.py` enforces quiet hours, allow/block lists, and merges
   heuristic/LLM scores. Customize to match family policy needs.
+- **Structured logging** – Session-scoped JSON logs under `logs/sessions/YYYYMMDD_session_###.log`
+  trace planner/headline/url/ocr/policy runs, routing decisions, and final actions. Logging failures
+  do not break the pipeline.
 
 ## Development Notes
 - `make setup` mirrors the quick start steps using the included `Makefile`.
